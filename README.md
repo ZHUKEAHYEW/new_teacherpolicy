@@ -1,162 +1,174 @@
-# BeyondMimic Motion Tracking Code
+# 项目仓库使用说明
 
-[![IsaacSim](https://img.shields.io/badge/IsaacSim-4.5.0-silver.svg)](https://docs.omniverse.nvidia.com/isaacsim/latest/overview.html)
-[![Isaac Lab](https://img.shields.io/badge/IsaacLab-2.1.0-silver)](https://isaac-sim.github.io/IsaacLab)
-[![Python](https://img.shields.io/badge/python-3.10-blue.svg)](https://docs.python.org/3/whatsnew/3.10.html)
-[![Linux platform](https://img.shields.io/badge/platform-linux--64-orange.svg)](https://releases.ubuntu.com/20.04/)
-[![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit&logoColor=white)](https://pre-commit.com/)
-[![License](https://img.shields.io/badge/license-MIT-yellow.svg)](https://opensource.org/license/mit)
+## 核心文件：
 
-[[Website]](https://beyondmimic.github.io/)
-[[Arxiv]](https://arxiv.org/abs/2508.08241)
-[[Video]](https://youtu.be/RS_MtKVIAzY)
+whole\_body\_tracking/scripts/rsl\_rl/train.py ——— 训练代码
+whole\_body\_tracking/scripts/rsl\_rl/play.py ——— 可视化代码
+whole\_body\_tracking/scripts/rsl\_rl/replay\_npz.py ——— 回放检查npz代码
 
-## Overview
+## 安装流程:
 
-BeyondMimic is a versatile humanoid control framework that provides highly dynamic motion tracking with the
-state-of-the-art motion quality on real-world deployment and steerable test-time control with guided diffusion-based
-controllers.
+1.激活isaaacsim环境
 
-This repo covers the motion tracking training in BeyondMimic. **You should be able to
-train any sim-to-real-ready motion in the LAFAN1 dataset, without tuning any parameters**.
+- conda activate env\_isaaclab
 
-For sim-to-sim and sim-to-real deployment, please refer to
-the [motion_tracking_controller](https://github.com/HybridRobotics/motion_tracking_controller).
+2.切换至仓库目录
 
-### Alternative Implementations
+- cd /home/user\_name/whole\_body\_tracking   （需要替换为你的项目路径）
 
-- There is an alternative reproduction of BeyondMimic in [mjlab](https://github.com/mujocolab/mjlab), a new Isaac Lab-style manager API powered by MuJoCo-Warp for RL and robotics research. See the implementation [here](https://github.com/mujocolab/mjlab/blob/main/src/mjlab/tasks/tracking/tracking_env_cfg.py).
+3.安装该仓库
 
-## Installation
+- python -m pip install -e source/whole\_body\_tracking
 
-- Install Isaac Lab v2.1.0 by following
-  the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html). We recommend
-  using the conda installation as it simplifies calling Python scripts from the terminal.
+## 进行训练
 
-- Clone this repository separately from the Isaac Lab installation (i.e., outside the `IsaacLab` directory):
+### 注意事项
+
+默认并行环境数在 `tracking_env_cfg.py` 中是 `16384`。如果显存不够，可通过 `--num_envs` 覆盖。
+
+### 快速启动训练
 
 ```bash
-# Option 1: SSH
-git clone git@github.com:HybridRobotics/whole_body_tracking.git
+cd /home/user_name/whole_body_tracking
 
-# Option 2: HTTPS
-git clone https://github.com/HybridRobotics/whole_body_tracking.git
+python scripts/rsl_rl/train.py \
+  --task=Tracking-Flat-G1-v0 \
+  --motion_file data/climb_15_z_scale_1.0_0000.npz \
+  --manifest_file data/batch_manifest.json \
+  --terrain_file climb_15/multi_boxes_z_scale_1.0/multi_boxes_z_scale_1.0.usd \
+  --terrain_use_manifest_pose \
+  --headless \
+  --logger tensorboard \
+  --run_name climb_15_local \
+  --max_iterations 10000
 ```
 
-- Pull the robot description files from GCS
+训练日志默认保存到：
+
+```
+logs/rsl_rl/g1_flat/<timestamp>_<run_name>/
+```
+
+### 查看 TensorBoard 曲线
+
+训练命令中使用了：
 
 ```bash
-# Enter the repository
-cd whole_body_tracking
-# Rename all occurrences of whole_body_tracking (in files/directories) to your_fancy_extension_name
-curl -L -o unitree_description.tar.gz https://storage.googleapis.com/qiayuanl_robot_descriptions/unitree_description.tar.gz && \
-tar -xzf unitree_description.tar.gz -C source/whole_body_tracking/whole_body_tracking/assets/ && \
-rm unitree_description.tar.gz
+--logger tensorboard
 ```
 
-- Using a Python interpreter that has Isaac Lab installed, install the library
+训练过程中的 reward、loss、learning rate、KL、episode length 等日志会写入：
+
+```text
+logs/rsl_rl/g1_flat/
+```
+
+启动 TensorBoard：
 
 ```bash
-python -m pip install -e source/whole_body_tracking
+cd /home/user_name/whole_body_tracking
+tensorboard --logdir logs/rsl_rl/g1_flat
 ```
 
-## Motion Tracking
+启动后在浏览器打开终端提示的地址，通常是：
 
-### Motion Preprocessing & Registry Setup
+```text
+http://localhost:6006
+```
 
-In order to manage the large set of motions we used in this work, we leverage the WandB registry to store and load
-reference motions automatically.
-Note: The reference motion should be retargeted and use generalized coordinates only.
+如果遇到：
 
-- Gather the reference motion datasets (please follow the original licenses), we use the same convention as .csv of
-  Unitree's dataset
+```text
+ModuleNotFoundError: No module named 'pkg_resources'
+```
 
-    - Unitree-retargeted LAFAN1 Dataset is available
-      on [HuggingFace](https://huggingface.co/datasets/lvhaidong/LAFAN1_Retargeting_Dataset)
-    - Sidekicks are from [KungfuBot](https://kungfu-bot.github.io/)
-    - Christiano Ronaldo celebration is from [ASAP](https://github.com/LeCAR-Lab/ASAP).
-    - Balance motions are from [HuB](https://hub-robot.github.io/)
-
-
-- Log in to your WandB account; access Registry under Core on the left. Create a new registry collection with the name "
-  Motions" and artifact type "All Types".
-
-
-- Convert retargeted motions to include the maximum coordinates information (body pose, body velocity, and body
-  acceleration) via forward kinematics,
+在 Isaac Lab 环境中执行：
 
 ```bash
-python scripts/csv_to_npz.py --input_file {motion_name}.csv --input_fps 30 --output_name {motion_name} --headless
+pip install "setuptools<81" --force-reinstall
 ```
 
-This will automatically upload the processed motion file to the WandB registry with output name {motion_name}.
+然后重新启动 TensorBoard。
 
-- Test if the WandB registry works properly by replaying the motion in Isaac Sim:
+关键参数解析：
+
+- `--motion_file`: 本地参考动作 `.npz`。
+- `--manifest_file`: 用于读取 skill anchor、terrain pose 等对齐信息。
+- `--terrain_file`: 本地 terrain USD。
+- `--terrain_use_manifest_pose`: 使用 manifest 中的 terrain 世界位姿。
+- `--fixed_start_frame -1`: 使用 adaptive random start-frame sampling。训练默认就是 `-1`。
+- `--fixed_start_frame 0`: 每次 episode 从第 0 帧开始 （train.py默认是随机采样开始）
+- `--num_envs`: 覆盖默认并行环境数。
+
+追加参数：
+
+- **从已有 checkpoint 继续训练**：
 
 ```bash
-python scripts/replay_npz.py --registry_name={your-organization}-org/wandb-registry-motions/{motion_name}
+--resume True \
+--load_run 2026-05-01_15-36-06_climb_15_high_jump \
+--checkpoint model_10000.pt
 ```
 
-- Debugging
-    - Make sure to export WANDB_ENTITY to your organization name, not your personal username.
-    - If /tmp folder is not accessible, modify csv_to_npz.py L319 & L326 to a temporary folder of your choice.
+温馨提醒： `--load_run` 是 `logs/rsl_rl/g1_flat/` 下的 run 文件夹名，`--checkpoint` 是该目录中的 checkpoint 文件名。
 
-### Policy Training
+## Play
 
-- Train policy by the following command:
+播放本地 checkpoint：
 
 ```bash
-python scripts/rsl_rl/train.py --task=Tracking-Flat-G1-v0 \
---registry_name {your-organization}-org/wandb-registry-motions/{motion_name} \
---headless --logger wandb --log_project_name {project_name} --run_name {run_name}
+cd /home/user_name/whole_body_tracking
+
+python scripts/rsl_rl/play.py \
+  --task=Tracking-Flat-G1-v0 \
+  --num_envs=1 \
+  --motion_file data/climb_15_z_scale_1.0_0000.npz \
+  --manifest_file data/batch_manifest.json \
+  --terrain_file climb_15/multi_boxes_z_scale_1.0/multi_boxes_z_scale_1.0.usd \
+  --terrain_use_manifest_pose \
+  --load_run 2026-05-01_15-36-06_climb_15_high_jump \
+  --checkpoint model_10000.pt
 ```
 
-### Policy Evaluation
+## 如需要录制视频
 
-- Play the trained policy by the following command:
+\--video \
+\--video\_length 5000
 
-```bash
-python scripts/rsl_rl/play.py --task=Tracking-Flat-G1-v0 --num_envs=2 --wandb_path={wandb-run-path}
+- 视频路径：
+  `logs/rsl_rl/g1_flat/<load_run>/videos/play/`
+
+## 代码结构
+
 ```
-
-The WandB run path can be located in the run overview. It follows the format {your_organization}/{project_name}/ along
-with a unique 8-character identifier. Note that run_name is different from run_path.
-
-## Code Structure
-
-Below is an overview of the code structure for this repository:
-
-- **`source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp`**
-  This directory contains the atomic functions to define the MDP for BeyondMimic. Below is a breakdown of the functions:
-
-    - **`commands.py`**
-      Command library to compute relevant variables from the reference motion, current robot state, and error
-      computations. This includes pose and velocity error calculation, initial state randomization, and adaptive
-      sampling.
-
-    - **`rewards.py`**
-      Implements the DeepMimic reward functions and smoothing terms.
-
-    - **`events.py`**
-      Implements domain randomization terms.
-
-    - **`observations.py`**
-      Implements observation terms for motion tracking and data collection.
-
-    - **`terminations.py`**
-      Implements early terminations and timeouts.
-
-- **`source/whole_body_tracking/whole_body_tracking/tasks/tracking/tracking_env_cfg.py`**
-  Contains the environment (MDP) hyperparameters configuration for the tracking task.
-
-- **`source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/agents/rsl_rl_ppo_cfg.py`**
-  Contains the PPO hyperparameters for the tracking task.
-
-- **`source/whole_body_tracking/whole_body_tracking/robots`**
-  Contains robot-specific settings, including armature parameters, joint stiffness/damping calculation, and action scale
-  calculation.
-
-- **`scripts`**
-  Includes utility scripts for preprocessing motion data, training policies, and evaluating trained policies.
-
-This structure is designed to ensure modularity and ease of navigation for developers expanding the project.
+whole_body_tracking/
+│
+├── scripts/rsl_rl/
+│   ├── train.py                 # 训练脚本
+│   ├── play.py                  # 可视化/播放脚本
+│   ├── replay_local_npz.py      # NPZ 回放检查脚本
+│   └── cli_args.py              # 命令行参数定义
+│
+├── source/whole_body_tracking/whole_body_tracking/
+│   │
+│   ├── tasks/tracking/
+│   │   ├── tracking_env_cfg.py              # 环境配置
+│   │   ├── mdp/                             # 马尔可夫决策过程模块
+│   │   │   ├── commands.py                  # 命令生成
+│   │   │   ├── observations.py              # 观测空间
+│   │   │   ├── rewards.py                   # 奖励函数
+│   │   │   ├── terminations.py              # 终止条件
+│   │   │   └── events.py                    # 随机事件
+│   │   └── config/g1/
+│   │       ├── __init__.py
+│   │       ├── flat_env_cfg.py              # 平地环境配置
+│   │       └── agents/
+│   │           └── rsl_rl_ppo_cfg.py        # PPO 算法配置
+│   │
+│   ├── robots/
+│   │   └── g1.py                            # G1 机器人定义
+│   │
+│   └── utils/
+│       ├── exporter.py                      # 导出工具
+│       └── my_on_policy_runner.py           # 自定义 on-policy 执行器
+```

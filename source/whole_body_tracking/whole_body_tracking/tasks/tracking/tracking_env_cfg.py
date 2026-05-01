@@ -12,7 +12,7 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensorCfg
+from isaaclab.sensors import ContactSensorCfg, MultiMeshRayCasterCfg, patterns
 from isaaclab.terrains import TerrainImporterCfg
 
 ##
@@ -35,6 +35,10 @@ VELOCITY_RANGE = {
     "pitch": (-0.52, 0.52),
     "yaw": (-0.78, 0.78),
 }
+
+HEIGHT_SCAN_SIZE = [0.7, 0.7]
+HEIGHT_SCAN_RESOLUTION = 0.1
+HEIGHT_SCAN_OFFSET = 0.5
 
 
 @configclass
@@ -59,6 +63,14 @@ class MySceneCfg(InteractiveSceneCfg):
     )
     # robots
     robot: ArticulationCfg = MISSING
+    height_scanner = MultiMeshRayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/torso_link",
+        offset=MultiMeshRayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+        ray_alignment="yaw",
+        pattern_cfg=patterns.GridPatternCfg(resolution=HEIGHT_SCAN_RESOLUTION, size=HEIGHT_SCAN_SIZE),
+        debug_vis=False,
+        mesh_prim_paths=["/World/ground"],
+    )
     # lights
     light = AssetBaseCfg(
         prim_path="/World/light",
@@ -126,6 +138,12 @@ class ObservationsCfg:
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.5, n_max=0.5))
+        height_scan = ObsTerm(
+            func=mdp.height_scan,
+            params={"sensor_cfg": SceneEntityCfg("height_scanner"), "offset": HEIGHT_SCAN_OFFSET},
+            noise=Unoise(n_min=-0.05, n_max=0.05),
+            clip=(-1.0, 1.0),
+        )
         actions = ObsTerm(func=mdp.last_action)
 
         def __post_init__(self):
@@ -143,6 +161,10 @@ class ObservationsCfg:
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        height_scan = ObsTerm(
+            func=mdp.height_scan,
+            params={"sensor_cfg": SceneEntityCfg("height_scanner"), "offset": HEIGHT_SCAN_OFFSET},
+        )
         actions = ObsTerm(func=mdp.last_action)
 
     # observation groups
@@ -204,6 +226,11 @@ class RewardsCfg:
         weight=0.5,
         params={"command_name": "motion", "std": 0.3},
     )
+    motion_global_anchor_height = RewTerm(
+        func=mdp.motion_global_anchor_height_error_exp,
+        weight=1.0,
+        params={"command_name": "motion", "std": 0.12},
+    )
     motion_global_anchor_ori = RewTerm(
         func=mdp.motion_global_anchor_orientation_error_exp,
         weight=0.5,
@@ -213,6 +240,20 @@ class RewardsCfg:
         func=mdp.motion_relative_body_position_error_exp,
         weight=1.0,
         params={"command_name": "motion", "std": 0.3},
+    )
+    motion_ee_height = RewTerm(
+        func=mdp.motion_relative_body_height_error_exp,
+        weight=1.0,
+        params={
+            "command_name": "motion",
+            "std": 0.12,
+            "body_names": [
+                "left_ankle_roll_link",
+                "right_ankle_roll_link",
+                "left_wrist_yaw_link",
+                "right_wrist_yaw_link",
+            ],
+        },
     )
     motion_body_ori = RewTerm(
         func=mdp.motion_relative_body_orientation_error_exp,
@@ -224,12 +265,26 @@ class RewardsCfg:
         weight=1.0,
         params={"command_name": "motion", "std": 1.0},
     )
+    motion_ee_vertical_vel = RewTerm(
+        func=mdp.motion_global_body_vertical_velocity_error_exp,
+        weight=0.5,
+        params={
+            "command_name": "motion",
+            "std": 0.5,
+            "body_names": [
+                "left_ankle_roll_link",
+                "right_ankle_roll_link",
+                "left_wrist_yaw_link",
+                "right_wrist_yaw_link",
+            ],
+        },
+    )
     motion_body_ang_vel = RewTerm(
         func=mdp.motion_global_body_angular_velocity_error_exp,
         weight=1.0,
         params={"command_name": "motion", "std": 3.14},
     )
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1e-1)
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-3e-2)
     joint_limit = RewTerm(
         func=mdp.joint_pos_limits,
         weight=-10.0,
@@ -257,7 +312,7 @@ class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
     anchor_pos = DoneTerm(
         func=mdp.bad_anchor_pos_z_only,
-        params={"command_name": "motion", "threshold": 0.25},
+        params={"command_name": "motion", "threshold": 0.45},
     )
     anchor_ori = DoneTerm(
         func=mdp.bad_anchor_ori,
@@ -267,7 +322,7 @@ class TerminationsCfg:
         func=mdp.bad_motion_body_pos_z_only,
         params={
             "command_name": "motion",
-            "threshold": 0.25,
+            "threshold": 0.8,
             "body_names": [
                 "left_ankle_roll_link",
                 "right_ankle_roll_link",
@@ -295,7 +350,7 @@ class TrackingEnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for the locomotion velocity-tracking environment."""
 
     # Scene settings
-    scene: MySceneCfg = MySceneCfg(num_envs=4096, env_spacing=2.5)
+    scene: MySceneCfg = MySceneCfg(num_envs=16384, env_spacing=2.5)
     # Basic settings
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
@@ -316,7 +371,9 @@ class TrackingEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.render_interval = self.decimation
         self.sim.physics_material = self.scene.terrain.physics_material
         self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
+        if self.scene.height_scanner is not None:
+            self.scene.height_scanner.update_period = self.decimation * self.sim.dt
         # viewer settings
-        self.viewer.eye = (1.5, 1.5, 1.5)
-        self.viewer.origin_type = "asset_root"
-        self.viewer.asset_name = "robot"
+        self.viewer.eye = (4.0, 4.0, 2.5)
+        self.viewer.lookat = (0.0, 0.0, 0.8)
+        self.viewer.origin_type = "world"

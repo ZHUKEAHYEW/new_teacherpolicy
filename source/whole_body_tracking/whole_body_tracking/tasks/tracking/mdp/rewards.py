@@ -23,6 +23,12 @@ def motion_global_anchor_position_error_exp(env: ManagerBasedRLEnv, command_name
     return torch.exp(-error / std**2)
 
 
+def motion_global_anchor_height_error_exp(env: ManagerBasedRLEnv, command_name: str, std: float) -> torch.Tensor:
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    error = torch.square(command.anchor_pos_w[:, 2] - command.robot_anchor_pos_w[:, 2])
+    return torch.exp(-error / std**2)
+
+
 def motion_global_anchor_orientation_error_exp(env: ManagerBasedRLEnv, command_name: str, std: float) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
     error = quat_error_magnitude(command.anchor_quat_w, command.robot_anchor_quat_w) ** 2
@@ -36,6 +42,17 @@ def motion_relative_body_position_error_exp(
     body_indexes = _get_body_indexes(command, body_names)
     error = torch.sum(
         torch.square(command.body_pos_relative_w[:, body_indexes] - command.robot_body_pos_w[:, body_indexes]), dim=-1
+    )
+    return torch.exp(-error.mean(-1) / std**2)
+
+
+def motion_relative_body_height_error_exp(
+    env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None
+) -> torch.Tensor:
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    body_indexes = _get_body_indexes(command, body_names)
+    error = torch.square(
+        command.body_pos_relative_w[:, body_indexes, 2] - command.robot_body_pos_w[:, body_indexes, 2]
     )
     return torch.exp(-error.mean(-1) / std**2)
 
@@ -60,6 +77,15 @@ def motion_global_body_linear_velocity_error_exp(
     error = torch.sum(
         torch.square(command.body_lin_vel_w[:, body_indexes] - command.robot_body_lin_vel_w[:, body_indexes]), dim=-1
     )
+    return torch.exp(-error.mean(-1) / std**2)
+
+
+def motion_global_body_vertical_velocity_error_exp(
+    env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None
+) -> torch.Tensor:
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    body_indexes = _get_body_indexes(command, body_names)
+    error = torch.square(command.body_lin_vel_w[:, body_indexes, 2] - command.robot_body_lin_vel_w[:, body_indexes, 2])
     return torch.exp(-error.mean(-1) / std**2)
 
 
