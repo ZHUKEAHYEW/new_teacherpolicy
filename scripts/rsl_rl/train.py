@@ -3,9 +3,18 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Script to train RL agent with RSL-RL."""
+"""使用 RSL-RL 训练 G1 全身轨迹跟踪策略。
 
-"""Launch Isaac Sim Simulator first."""
+主要流程：
+1. 启动 Isaac Sim/Isaac Lab app。
+2. 读取命令行参数，配置 motion、manifest、terrain 和 PPO。
+3. 创建 Tracking-Flat-G1-v0 环境。
+4. 用 RSL-RL OnPolicyRunner 训练并保存 checkpoint。
+
+这个脚本只负责训练；可视化 checkpoint 请用 `scripts/rsl_rl/play.py`。
+"""
+
+"""先启动 Isaac Sim 仿真程序。"""
 
 import argparse
 import json
@@ -15,7 +24,7 @@ import sys
 
 from isaaclab.app import AppLauncher
 
-# local imports
+# 本地脚本导入
 import cli_args  # isort: skip
 
 G1_CANONICAL_JOINT_NAMES = [
@@ -83,7 +92,7 @@ G1_CANONICAL_BODY_NAMES = [
     "right_wrist_yaw_link",
 ]
 
-# add argparse arguments
+# 本地训练流程专用的命令行参数。
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
@@ -93,6 +102,8 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--motion_file", type=str, default=None, help="Path to the local motion npz file.")
+parser.add_argument("--motion_files", nargs="+", default=None, help="Paths to local motion npz files.")
+parser.add_argument("--motion_dir", type=str, default=None, help="Directory containing local motion npz files.")
 parser.add_argument(
     "--motion_source_order",
     type=str,
@@ -116,24 +127,24 @@ parser.add_argument(
 )
 parser.add_argument("--env_spacing", type=float, default=None, help="Environment spacing override.")
 
-# append RSL-RL cli arguments
+# 追加 RSL-RL 命令行参数
 cli_args.add_rsl_rl_args(parser)
-# append AppLauncher cli args
+# 追加 Isaac Sim AppLauncher 命令行参数
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
-# always enable cameras to record video
+# 录制视频时必须启用 camera
 if args_cli.video:
     args_cli.enable_cameras = True
 
-# clear out sys.argv for Hydra
+# 清理 sys.argv，避免 Hydra 解析到非 Hydra 参数
 sys.argv = [sys.argv[0]] + hydra_args
 
-# launch omniverse app
+# 启动 Omniverse / Isaac Sim app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-"""Rest everything follows."""
+"""Isaac Sim 启动后，再导入依赖仿真的模块。"""
 
 import gymnasium as gym
 import isaaclab.sim as sim_utils
@@ -157,7 +168,7 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 from rsl_rl.runners import OnPolicyRunner
 
-# Import extensions to set up environment tasks
+# 导入扩展以注册环境任务
 import whole_body_tracking.tasks  # noqa: F401
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -167,18 +178,25 @@ torch.backends.cudnn.benchmark = False
 
 
 def dump_pickle(filename: str, data: object):
+    """把 Python 配置对象保存到日志目录，方便精确复现实验。"""
     os.makedirs(os.path.dirname(filename), exist_ok=True)
     with open(filename, "wb") as f:
         pickle.dump(data, f)
 
 
 def _yaw_quat_wxyz(yaw_deg: float) -> tuple[float, float, float, float]:
+    """把角度制 yaw 转成 Isaac/Usd 使用的 WXYZ 四元数。"""
     yaw_rad = math.radians(float(yaw_deg))
     half_yaw = 0.5 * yaw_rad
     return (math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw))
 
 
 def _add_height_scan_terrain_target(env_cfg: ManagerBasedRLEnvCfg):
+    """让高度扫描器也扫描本地加载的 terrain USD。
+
+    基础配置只扫描 `/World/ground`。如果每个环境里插入了箱子地形，
+    scanner 必须包含 `{ENV_REGEX_NS}/Terrain`，否则策略看不到箱子。
+    """
     height_scanner = getattr(env_cfg.scene, "height_scanner", None)
     if height_scanner is None or not hasattr(height_scanner.__class__, "RaycastTargetCfg"):
         return
@@ -197,6 +215,7 @@ def _add_height_scan_terrain_target(env_cfg: ManagerBasedRLEnvCfg):
 
 
 def _load_manifest_entry(manifest_file: str | None, motion_file: str) -> dict | None:
+    """在 manifest 中找到某个 motion npz 对应的 trajectory 条目。"""
     if manifest_file is None:
         return None
 
@@ -229,6 +248,7 @@ def _load_manifest_entry(manifest_file: str | None, motion_file: str) -> dict | 
 
 
 def _get_skill_output_start_frame(manifest_entry: dict) -> int:
+    """返回生成技能轨迹开始执行的第一帧。"""
     for segment in manifest_entry.get("segments", []):
         if segment.get("mode") == "skill_execution":
             return int(segment["output_start_frame"])
@@ -236,6 +256,7 @@ def _get_skill_output_start_frame(manifest_entry: dict) -> int:
 
 
 def _rotate_xyz_by_yaw_deg(xyz: np.ndarray, yaw_deg: float) -> np.ndarray:
+    """把 3D 平移向量绕世界 z 轴旋转 yaw 角度。"""
     yaw_rad = np.deg2rad(float(yaw_deg))
     cos_yaw = np.cos(yaw_rad)
     sin_yaw = np.sin(yaw_rad)
@@ -252,6 +273,11 @@ def _rotate_xyz_by_yaw_deg(xyz: np.ndarray, yaw_deg: float) -> np.ndarray:
 def _compute_manifest_motion_offset(
     manifest_entry: dict, motion_file: str, root_body_idx: int, use_manifest_terrain_pose: bool
 ) -> tuple[float, float, float]:
+    """把 npz 根节点位置对齐到 manifest 里的 skill anchor。
+
+    动作生成器和 Isaac 场景可能使用不同世界原点。这里计算出的 offset 会平移
+    参考轨迹里的所有 body 位置，让 skill 第一帧从选定 terrain 上的 manifest anchor 开始。
+    """
     data = np.load(motion_file)
     body_pos_w = np.asarray(data["body_pos_w"], dtype=np.float32)
     skill_output_start = _get_skill_output_start_frame(manifest_entry)
@@ -285,6 +311,7 @@ def _compute_manifest_motion_offset(
 def _add_manifest_terrain(
     env_cfg: ManagerBasedRLEnvCfg, terrain_file: str, manifest_entry: dict | None, use_manifest_pose: bool
 ):
+    """给每个并行环境挂载一个本地 terrain USD。"""
     terrain_path = os.path.abspath(terrain_file)
     if not os.path.isfile(terrain_path):
         raise FileNotFoundError(f"Invalid terrain file path: {terrain_path}")
@@ -313,6 +340,11 @@ def _add_manifest_terrain(
 
 
 def _use_fixed_motion_start(env_cfg: ManagerBasedRLEnvCfg, start_frame: int):
+    """强制每次 reset 都从同一个参考帧开始。
+
+    这适合确定性 debug/play。正常训练应保持 `--fixed_start_frame -1`，
+    让策略看到更多起始状态。
+    """
     env_cfg.commands.motion.fixed_start_frame = start_frame
     env_cfg.commands.motion.pose_range = {
         "x": (0.0, 0.0),
@@ -334,10 +366,46 @@ def _use_fixed_motion_start(env_cfg: ManagerBasedRLEnvCfg, start_frame: int):
     print(f"[INFO]: Fixed motion reset frame: {start_frame}")
 
 
+def _resolve_motion_files() -> list[str]:
+    """从 --motion_file、--motion_files、--motion_dir 收集动作文件。
+
+    返回值会转为绝对路径，检查文件存在，目录输入会排序，并去重。
+    """
+    motion_files = []
+    if args_cli.motion_file is not None:
+        motion_files.append(args_cli.motion_file)
+    if args_cli.motion_files is not None:
+        motion_files.extend(args_cli.motion_files)
+    if args_cli.motion_dir is not None:
+        motion_dir = os.path.abspath(args_cli.motion_dir)
+        if not os.path.isdir(motion_dir):
+            raise FileNotFoundError(f"Invalid motion directory path: {motion_dir}")
+        motion_files.extend(
+            os.path.join(motion_dir, name)
+            for name in sorted(os.listdir(motion_dir))
+            if name.endswith(".npz")
+        )
+
+    if not motion_files:
+        raise ValueError("Provide --motion_file, --motion_files, or --motion_dir for local training.")
+
+    resolved = []
+    seen = set()
+    for motion_file in motion_files:
+        motion_path = os.path.abspath(motion_file)
+        if motion_path in seen:
+            continue
+        if not os.path.isfile(motion_path):
+            raise FileNotFoundError(f"Invalid motion file path: {motion_path}")
+        resolved.append(motion_path)
+        seen.add(motion_path)
+    return resolved
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
-    """Train with RSL-RL agent."""
-    # override configurations with non-hydra CLI arguments
+    """使用 RSL-RL agent 开始训练。"""
+    # 用非 Hydra 命令行参数覆盖默认配置。
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.scene.env_spacing = args_cli.env_spacing if args_cli.env_spacing is not None else env_cfg.scene.env_spacing
@@ -345,52 +413,62 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
 
-    # set the environment seed
-    # note: certain randomizations occur in the environment initialization so we set the seed here
+    # 设置环境随机种子。部分随机化会在环境初始化时发生，所以这里先设置。
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
-    # load the motion file from local disk
-    if args_cli.motion_file is None:
-        raise ValueError("--motion_file must be provided for local training.")
-    motion_file = os.path.abspath(args_cli.motion_file)
-    if not os.path.isfile(motion_file):
-        raise FileNotFoundError(f"Invalid motion file path: {motion_file}")
-    print(f"[INFO]: Using local motion file: {motion_file}")
-    env_cfg.commands.motion.motion_file = motion_file
+    # 加载一个或多个本地参考动作；多轨迹采样在 MotionCommand 内部处理。
+    motion_files = _resolve_motion_files()
+    print("[INFO]: Using local motion files:")
+    for motion_file in motion_files:
+        print(f"  - {motion_file}")
+    env_cfg.commands.motion.motion_file = motion_files[0]
+    env_cfg.commands.motion.motion_files = motion_files
     if args_cli.motion_source_order == "g1_canonical":
         env_cfg.commands.motion.source_joint_names = G1_CANONICAL_JOINT_NAMES
         env_cfg.commands.motion.source_body_names = G1_CANONICAL_BODY_NAMES
 
-    manifest_entry = _load_manifest_entry(args_cli.manifest_file, env_cfg.commands.motion.motion_file)
-    if manifest_entry is not None:
-        env_cfg.commands.motion.motion_position_offset = _compute_manifest_motion_offset(
-            manifest_entry,
-            env_cfg.commands.motion.motion_file,
-            args_cli.motion_root_body_idx,
-            args_cli.terrain_use_manifest_pose,
-        )
-        print(f"[INFO]: Manifest trajectory: {manifest_entry.get('trajectory_name', '')}")
+    # 一个 manifest 可以包含多条 trajectory；每个 npz 按文件名或 trajectory_name 匹配。
+    manifest_entries = [_load_manifest_entry(args_cli.manifest_file, motion_file) for motion_file in motion_files]
+    if any(entry is not None for entry in manifest_entries):
+        motion_offsets = []
+        for motion_file, manifest_entry in zip(motion_files, manifest_entries):
+            if manifest_entry is None:
+                motion_offsets.append(None)
+                continue
+            motion_offsets.append(
+                _compute_manifest_motion_offset(
+                    manifest_entry,
+                    motion_file,
+                    args_cli.motion_root_body_idx,
+                    args_cli.terrain_use_manifest_pose,
+                )
+            )
+            print(f"[INFO]: Manifest trajectory: {manifest_entry.get('trajectory_name', '')}")
+        env_cfg.commands.motion.motion_position_offsets = motion_offsets
+        env_cfg.commands.motion.motion_position_offset = motion_offsets[0]
 
     if args_cli.terrain_file is not None:
-        _add_manifest_terrain(env_cfg, args_cli.terrain_file, manifest_entry, args_cli.terrain_use_manifest_pose)
+        # 当前环境每次运行只支持一个 terrain USD。多轨迹时使用第一个匹配 manifest 条目的 terrain pose。
+        terrain_manifest_entry = next((entry for entry in manifest_entries if entry is not None), None)
+        _add_manifest_terrain(env_cfg, args_cli.terrain_file, terrain_manifest_entry, args_cli.terrain_use_manifest_pose)
 
     if args_cli.fixed_start_frame >= 0:
         _use_fixed_motion_start(env_cfg, args_cli.fixed_start_frame)
 
-    # specify directory for logging experiments
+    # 设置实验日志根目录
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
-    # specify directory for logging runs: {time-stamp}_{run_name}
+    # 设置本次 run 的日志目录：{time-stamp}_{run_name}
     log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     if agent_cfg.run_name:
         log_dir += f"_{agent_cfg.run_name}"
     log_dir = os.path.join(log_root_path, log_dir)
 
-    # create isaac environment
+    # 创建 Isaac 环境
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-    # wrap for video recording
+    # 如需录制视频，给环境包一层 RecordVideo
     if args_cli.video:
         video_kwargs = {
             "video_folder": os.path.join(log_dir, "videos", "train"),
@@ -402,40 +480,40 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
-    # convert to single-agent instance if required by the RL algorithm
+    # 如果任务是多 agent，转换成单 agent 形式给 RSL-RL 使用
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
-    # wrap around environment for rsl-rl
+    # 包装成 RSL-RL 需要的 VecEnv 接口
     env = RslRlVecEnvWrapper(env)
 
-    # create runner from rsl-rl
+    # 创建 RSL-RL runner
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
-    # write git state to logs
+    # 把 git 状态写入日志，方便之后追踪训练代码版本
     runner.add_git_repo_to_log(__file__)
-    # save resume path before creating a new log_dir
+    # 如果是续训，先找到旧 checkpoint 路径
     if agent_cfg.resume:
-        # get path to previous checkpoint
+        # 获取旧 checkpoint 路径
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        # load previously trained model
+        # 加载已经训练过的模型
         runner.load(resume_path)
 
-    # dump the configuration into log-directory
+    # 把环境和 agent 配置保存到日志目录
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
     dump_pickle(os.path.join(log_dir, "params", "env.pkl"), env_cfg)
     dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
-    # run training
+    # 开始训练
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
 
-    # close the simulator
+    # 关闭仿真环境
     env.close()
 
 
 if __name__ == "__main__":
-    # run the main function
+    # 运行主函数
     main()
-    # close sim app
+    # 关闭 Isaac Sim app
     simulation_app.close()

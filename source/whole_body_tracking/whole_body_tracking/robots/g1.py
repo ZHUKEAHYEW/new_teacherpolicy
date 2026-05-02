@@ -1,3 +1,12 @@
+"""Unitree G1 机器人资产和 actuator 配置。
+
+这个文件决定仿真里的 G1：
+- 从 `unitree_description/urdf/g1/main.urdf` 加载机器人。
+- 设置初始站姿、关节限位软系数、接触传感器。
+- 按腿、脚踝、腰、手臂分组设置隐式 PD actuator。
+- 根据 effort/stiffness 自动计算每个关节的 action scale。
+"""
+
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
@@ -9,6 +18,7 @@ ARMATURE_7520_14 = 0.010177520
 ARMATURE_7520_22 = 0.025101925
 ARMATURE_4010 = 0.00425
 
+# PD 增益由目标二阶系统响应计算得到。
 NATURAL_FREQ = 10 * 2.0 * 3.1415926535  # 10Hz
 DAMPING_RATIO = 2.0
 
@@ -23,6 +33,7 @@ DAMPING_7520_22 = 2.0 * DAMPING_RATIO * ARMATURE_7520_22 * NATURAL_FREQ
 DAMPING_4010 = 2.0 * DAMPING_RATIO * ARMATURE_4010 * NATURAL_FREQ
 
 G1_CYLINDER_CFG = ArticulationCfg(
+    # 把 URDF 里的 cylinder 碰撞体转成 capsule，接触仿真更稳定。
     spawn=sim_utils.UrdfFileCfg(
         fix_base=False,
         replace_cylinders_with_capsules=True,
@@ -45,6 +56,7 @@ G1_CYLINDER_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
+        # 名义半蹲站姿；MotionCommand 写入轨迹状态前会先用这个初始姿态。
         pos=(0.0, 0.0, 0.76),
         joint_pos={
             ".*_hip_pitch_joint": -0.312,
@@ -60,6 +72,7 @@ G1_CYLINDER_CFG = ArticulationCfg(
     ),
     soft_joint_pos_limit_factor=0.9,
     actuators={
+        # 腿部强关节。髋/膝的力矩和刚度很大程度决定跳跃、爬箱子能力。
         "legs": ImplicitActuatorCfg(
             joint_names_expr=[
                 ".*_hip_yaw_joint",
@@ -98,6 +111,7 @@ G1_CYLINDER_CFG = ArticulationCfg(
                 ".*_knee_joint": ARMATURE_7520_22,
             },
         ),
+        # 踝关节需要足够刚度，保证起跳和落地稳定。
         "feet": ImplicitActuatorCfg(
             effort_limit_sim=50.0,
             velocity_limit_sim=37.0,
@@ -106,6 +120,7 @@ G1_CYLINDER_CFG = ArticulationCfg(
             damping=2.0 * DAMPING_5020,
             armature=2.0 * ARMATURE_5020,
         ),
+        # 腰部 pitch/roll 在高动态动作中稳定躯干。
         "waist": ImplicitActuatorCfg(
             effort_limit_sim=50,
             velocity_limit_sim=37.0,
@@ -114,6 +129,7 @@ G1_CYLINDER_CFG = ArticulationCfg(
             damping=2.0 * DAMPING_5020,
             armature=2.0 * ARMATURE_5020,
         ),
+        # 腰 yaw 单独分组，因为它使用不同电机参数。
         "waist_yaw": ImplicitActuatorCfg(
             effort_limit_sim=88,
             velocity_limit_sim=32.0,
@@ -122,6 +138,7 @@ G1_CYLINDER_CFG = ArticulationCfg(
             damping=DAMPING_7520_14,
             armature=ARMATURE_7520_14,
         ),
+        # 手臂也参与跟踪；它们能帮助平衡，也可能在爬箱子时接触/支撑。
         "arms": ImplicitActuatorCfg(
             joint_names_expr=[
                 ".*_shoulder_pitch_joint",
@@ -182,6 +199,8 @@ G1_CYLINDER_CFG = ArticulationCfg(
 )
 
 G1_ACTION_SCALE = {}
+# 根据 effort/stiffness 计算一个保守的关节位置 action 范围。
+# scale 越大，policy 动作越强，但训练也更容易不稳定。
 for a in G1_CYLINDER_CFG.actuators.values():
     e = a.effort_limit_sim
     s = a.stiffness

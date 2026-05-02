@@ -8,23 +8,23 @@ if TYPE_CHECKING:
 
 
 def add_rsl_rl_args(parser: argparse.ArgumentParser):
-    """Add RSL-RL arguments to the parser.
+    """把 RSL-RL 相关命令行参数加入 parser。
 
-    Args:
-        parser: The parser to add the arguments to.
+    参数：
+        parser: 需要追加参数的 argparse parser。
     """
-    # create a new argument group
+    # 把 RSL-RL 参数放到单独分组里，方便 train/play/replay 复用。
     arg_group = parser.add_argument_group("rsl_rl", description="Arguments for RSL-RL agent.")
-    # -- experiment arguments
+    # 实验日志参数
     arg_group.add_argument(
         "--experiment_name", type=str, default=None, help="Name of the experiment folder where logs will be stored."
     )
     arg_group.add_argument("--run_name", type=str, default=None, help="Run name suffix to the log directory.")
-    # -- load arguments
+    # checkpoint 加载参数
     arg_group.add_argument("--resume", type=bool, default=None, help="Whether to resume from a checkpoint.")
     arg_group.add_argument("--load_run", type=str, default=None, help="Name of the run folder to resume from.")
     arg_group.add_argument("--checkpoint", type=str, default=None, help="Checkpoint file to resume from.")
-    # -- logger arguments
+    # 日志后端参数
     arg_group.add_argument(
         "--logger", type=str, default=None, choices={"tensorboard", "neptune"}, help="Logger module to use."
     )
@@ -34,34 +34,34 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
 
 
 def parse_rsl_rl_cfg(task_name: str, args_cli: argparse.Namespace) -> RslRlOnPolicyRunnerCfg:
-    """Parse configuration for RSL-RL agent based on inputs.
+    """根据 task 名称和命令行参数读取 RSL-RL 配置。
 
-    Args:
-        task_name: The name of the environment.
-        args_cli: The command line arguments.
+    参数：
+        task_name: Isaac Lab 任务名称。
+        args_cli: 命令行参数。
 
-    Returns:
-        The parsed configuration for RSL-RL agent based on inputs.
+    返回：
+        已经应用命令行覆盖项的 RSL-RL 配置。
     """
     from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
 
-    # load the default configuration
+    # 先从 Isaac Lab registry 读取任务默认配置，再应用命令行覆盖。
     rslrl_cfg: RslRlOnPolicyRunnerCfg = load_cfg_from_registry(task_name, "rsl_rl_cfg_entry_point")
     rslrl_cfg = update_rsl_rl_cfg(rslrl_cfg, args_cli)
     return rslrl_cfg
 
 
 def update_rsl_rl_cfg(agent_cfg: RslRlOnPolicyRunnerCfg, args_cli: argparse.Namespace):
-    """Update configuration for RSL-RL agent based on inputs.
+    """用命令行参数更新 RSL-RL 配置。
 
-    Args:
-        agent_cfg: The configuration for RSL-RL agent.
-        args_cli: The command line arguments.
+    参数：
+        agent_cfg: RSL-RL agent 配置。
+        args_cli: 命令行参数。
 
-    Returns:
-        The updated configuration for RSL-RL agent based on inputs.
+    返回：
+        更新后的 RSL-RL agent 配置。
     """
-    # override the default configuration with CLI arguments
+    # 只覆盖用户显式传入的值，其他保持配置文件默认值。
     if hasattr(args_cli, "seed") and args_cli.seed is not None:
         agent_cfg.seed = args_cli.seed
     if args_cli.resume is not None:
@@ -74,7 +74,7 @@ def update_rsl_rl_cfg(agent_cfg: RslRlOnPolicyRunnerCfg, args_cli: argparse.Name
         agent_cfg.run_name = args_cli.run_name
     if args_cli.logger is not None:
         agent_cfg.logger = args_cli.logger
-    # set the project name for neptune
+    # 设置 neptune 项目名；本地训练一般不使用。
     if agent_cfg.logger == "neptune" and args_cli.log_project_name:
         agent_cfg.neptune_project = args_cli.log_project_name
 

@@ -1,3 +1,9 @@
+"""全身轨迹跟踪任务的 Isaac Lab 基础环境配置。
+
+这里集中定义 scene、command、observation、reward、termination 和 domain randomization。
+具体机器人型号的差异在 `config/g1/flat_env_cfg.py` 中补充。
+"""
+
 from __future__ import annotations
 
 from dataclasses import MISSING
@@ -16,7 +22,7 @@ from isaaclab.sensors import ContactSensorCfg, MultiMeshRayCasterCfg, patterns
 from isaaclab.terrains import TerrainImporterCfg
 
 ##
-# Pre-defined configs
+# 预定义配置
 ##
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
@@ -24,7 +30,7 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 import whole_body_tracking.tasks.tracking.mdp as mdp
 
 ##
-# Scene definition
+# 场景定义
 ##
 
 VELOCITY_RANGE = {
@@ -36,6 +42,7 @@ VELOCITY_RANGE = {
     "yaw": (-0.78, 0.78),
 }
 
+# 高度扫描是 torso_link 附近的局部网格，帮助 policy 看到箱子/地形高度。
 HEIGHT_SCAN_SIZE = [0.7, 0.7]
 HEIGHT_SCAN_RESOLUTION = 0.1
 HEIGHT_SCAN_OFFSET = 0.5
@@ -43,9 +50,9 @@ HEIGHT_SCAN_OFFSET = 0.5
 
 @configclass
 class MySceneCfg(InteractiveSceneCfg):
-    """Configuration for the terrain scene with a legged robot."""
+    """带腿式机器人的 terrain 场景配置。"""
 
-    # ground terrain
+    # 默认平地。train.py/play.py 可以额外插入本地 USD 箱子地形。
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="plane",
@@ -61,8 +68,9 @@ class MySceneCfg(InteractiveSceneCfg):
             project_uvw=True,
         ),
     )
-    # robots
+    # 机器人资产由具体机器人配置填入。
     robot: ArticulationCfg = MISSING
+    # 挂在 torso_link 上的 raycast 网格，输出机器人周围的地形高度采样。
     height_scanner = MultiMeshRayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/torso_link",
         offset=MultiMeshRayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
@@ -71,7 +79,7 @@ class MySceneCfg(InteractiveSceneCfg):
         debug_vis=False,
         mesh_prim_paths=["/World/ground"],
     )
-    # lights
+    # 灯光
     light = AssetBaseCfg(
         prim_path="/World/light",
         spawn=sim_utils.DistantLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0),
@@ -86,14 +94,15 @@ class MySceneCfg(InteractiveSceneCfg):
 
 
 ##
-# MDP settings
+# MDP 设置
 ##
 
 
 @configclass
 class CommandsCfg:
-    """Command specifications for the MDP."""
+    """MDP 的 command 配置。"""
 
+    # MotionCommand 读取 npz 参考数据，并提供目标关节/body 状态。
     motion = mdp.MotionCommandCfg(
         asset_name="robot",
         resampling_time_range=(1.0e9, 1.0e9),
@@ -113,20 +122,21 @@ class CommandsCfg:
 
 @configclass
 class ActionsCfg:
-    """Action specifications for the MDP."""
+    """MDP 的 action 配置。"""
 
+    # PPO action 是围绕默认关节角的目标关节位置增量。
     joint_pos = mdp.JointPositionActionCfg(asset_name="robot", joint_names=[".*"], use_default_offset=True)
 
 
 @configclass
 class ObservationsCfg:
-    """Observation specifications for the MDP."""
+    """MDP 的 observation 配置。"""
 
     @configclass
     class PolicyCfg(ObsGroup):
-        """Observations for policy group."""
+        """policy 使用的 observation 组。"""
 
-        # observation terms (order preserved)
+        # observation 顺序会被保留；改变顺序后旧 checkpoint 通常不能继续使用，除非重新训练。
         command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
         motion_anchor_pos_b = ObsTerm(
             func=mdp.motion_anchor_pos_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.25, n_max=0.25)
@@ -147,11 +157,14 @@ class ObservationsCfg:
         actions = ObsTerm(func=mdp.last_action)
 
         def __post_init__(self):
+            # policy observation 加噪声以提高鲁棒性，并拼接成一个向量。
             self.enable_corruption = True
             self.concatenate_terms = True
 
     @configclass
     class PrivilegedCfg(ObsGroup):
+        """critic 专用 observation，不加噪声，并包含额外 body 状态。"""
+
         command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
         motion_anchor_pos_b = ObsTerm(func=mdp.motion_anchor_pos_b, params={"command_name": "motion"})
         motion_anchor_ori_b = ObsTerm(func=mdp.motion_anchor_ori_b, params={"command_name": "motion"})
@@ -167,16 +180,16 @@ class ObservationsCfg:
         )
         actions = ObsTerm(func=mdp.last_action)
 
-    # observation groups
+    # observation 组
     policy: PolicyCfg = PolicyCfg()
     critic: PrivilegedCfg = PrivilegedCfg()
 
 
 @configclass
 class EventCfg:
-    """Configuration for events."""
+    """event 配置。"""
 
-    # startup
+    # startup 随机化在环境创建时发生一次。
     physics_material = EventTerm(
         func=mdp.randomize_rigid_body_material,
         mode="startup",
@@ -208,7 +221,7 @@ class EventCfg:
         },
     )
 
-    # interval
+    # interval 推扰用于训练机器人从外部扰动中恢复。
     push_robot = EventTerm(
         func=mdp.push_by_setting_velocity,
         mode="interval",
@@ -219,8 +232,9 @@ class EventCfg:
 
 @configclass
 class RewardsCfg:
-    """Reward terms for the MDP."""
+    """MDP 的 reward 项。"""
 
+    # anchor reward 保持躯干/root 与参考轨迹对齐。
     motion_global_anchor_pos = RewTerm(
         func=mdp.motion_global_anchor_position_error_exp,
         weight=0.5,
@@ -241,6 +255,7 @@ class RewardsCfg:
         weight=1.0,
         params={"command_name": "motion", "std": 0.3},
     )
+    # 脚/手高度和竖直速度项对爬箱子、跳跃动作很重要。
     motion_ee_height = RewTerm(
         func=mdp.motion_relative_body_height_error_exp,
         weight=1.0,
@@ -285,6 +300,7 @@ class RewardsCfg:
         params={"command_name": "motion", "std": 3.14},
     )
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-3e-2)
+    # 避免 policy 贴近关节限位，并惩罚非末端执行器 link 的碰撞。
     joint_limit = RewTerm(
         func=mdp.joint_pos_limits,
         weight=-10.0,
@@ -307,9 +323,10 @@ class RewardsCfg:
 
 @configclass
 class TerminationsCfg:
-    """Termination terms for the MDP."""
+    """MDP 的终止条件。"""
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
+    # 高度/姿态/body 跟踪失败时尽早 reset 低质量 rollout。
     anchor_pos = DoneTerm(
         func=mdp.bad_anchor_pos_z_only,
         params={"command_name": "motion", "threshold": 0.45},
@@ -335,45 +352,45 @@ class TerminationsCfg:
 
 @configclass
 class CurriculumCfg:
-    """Curriculum terms for the MDP."""
+    """MDP 的 curriculum 配置。"""
 
     pass
 
 
 ##
-# Environment configuration
+# 环境配置
 ##
 
 
 @configclass
 class TrackingEnvCfg(ManagerBasedRLEnvCfg):
-    """Configuration for the locomotion velocity-tracking environment."""
+    """locomotion velocity-tracking 环境配置。"""
 
-    # Scene settings
+    # 默认并行环境数较高，用于快速收集 PPO 数据；显存不足时用 --num_envs 覆盖。
     scene: MySceneCfg = MySceneCfg(num_envs=16384, env_spacing=2.5)
-    # Basic settings
+    # 基础设置
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
     commands: CommandsCfg = CommandsCfg()
-    # MDP settings
+    # MDP 设置
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
     events: EventCfg = EventCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
 
     def __post_init__(self):
-        """Post initialization."""
-        # general settings
+        """配置初始化后的二次设置。"""
+        # 控制周期 = decimation * sim.dt = 0.02s，也就是 50 Hz policy 控制。
         self.decimation = 4
         self.episode_length_s = 10.0
-        # simulation settings
+        # 物理仿真 200 Hz；渲染和 scanner 更新跟随 policy step。
         self.sim.dt = 0.005
         self.sim.render_interval = self.decimation
         self.sim.physics_material = self.scene.terrain.physics_material
         self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
         if self.scene.height_scanner is not None:
             self.scene.height_scanner.update_period = self.decimation * self.sim.dt
-        # viewer settings
+        # viewer 视角设置
         self.viewer.eye = (4.0, 4.0, 2.5)
         self.viewer.lookat = (0.0, 0.0, 0.8)
         self.viewer.origin_type = "world"

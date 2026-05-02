@@ -93,6 +93,8 @@ pip install "setuptools<81" --force-reinstall
 关键参数解析：
 
 - `--motion_file`: 本地参考动作 `.npz`。
+- `--motion_files`: 一次传入多个本地参考动作 `.npz`，训练时每个并行环境会随机选择一条轨迹。
+- `--motion_dir`: 传入一个目录，训练时会自动读取目录下所有 `.npz` 轨迹。
 - `--manifest_file`: 用于读取 skill anchor、terrain pose 等对齐信息。
 - `--terrain_file`: 本地 terrain USD。
 - `--terrain_use_manifest_pose`: 使用 manifest 中的 terrain 世界位姿。
@@ -111,6 +113,47 @@ pip install "setuptools<81" --force-reinstall
 ```
 
 温馨提醒： `--load_run` 是 `logs/rsl_rl/g1_flat/` 下的 run 文件夹名，`--checkpoint` 是该目录中的 checkpoint 文件名。
+
+### 多轨迹训练
+
+方式一：手动列出多个 `.npz`：
+
+```bash
+cd /home/user_name/whole_body_tracking
+
+python scripts/rsl_rl/train.py \
+  --task=Tracking-Flat-G1-v0 \
+  --motion_files \
+    data/climb_15_z_scale_1.0_0000.npz \
+    data/climb_15_z_scale_1.0_0001.npz \
+    data/climb_15_z_scale_1.0_0002.npz \
+  --manifest_file data/batch_manifest.json \
+  --terrain_file climb_15/multi_boxes_z_scale_1.0/multi_boxes_z_scale_1.0.usd \
+  --terrain_use_manifest_pose \
+  --headless \
+  --logger tensorboard \
+  --run_name climb_15_multi \
+  --max_iterations 10000
+```
+
+方式二：读取目录下所有 `.npz`：
+
+```bash
+cd /home/user_name/whole_body_tracking
+
+python scripts/rsl_rl/train.py \
+  --task=Tracking-Flat-G1-v0 \
+  --motion_dir data \
+  --manifest_file data/batch_manifest.json \
+  --terrain_file climb_15/multi_boxes_z_scale_1.0/multi_boxes_z_scale_1.0.usd \
+  --terrain_use_manifest_pose \
+  --headless \
+  --logger tensorboard \
+  --run_name climb_15_multi_dir \
+  --max_iterations 10000
+```
+
+多轨迹训练要求所有 `.npz` 使用相同的 G1 关节和 body 维度。`batch_manifest.json` 中如果有多条 trajectory，代码会按 `.npz` 文件名或 `trajectory_name` 匹配对应条目。
 
 ## Play
 

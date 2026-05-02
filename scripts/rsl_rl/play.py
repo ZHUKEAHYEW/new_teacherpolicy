@@ -1,6 +1,15 @@
-"""Script to play a checkpoint if an RL agent from RSL-RL."""
+"""播放、录制并可选导出已经训练好的 RSL-RL checkpoint。
 
-"""Launch Isaac Sim Simulator first."""
+主要流程：
+1. 启动 Isaac Sim GUI 或 headless recorder。
+2. 配置和训练相同的 motion/manifest/terrain 环境。
+3. 从 logs/rsl_rl/<experiment>/<load_run>/<checkpoint> 加载策略。
+4. 循环执行 policy inference，把动作写入仿真。
+
+play 默认固定从 `--fixed_start_frame 0` 开始，便于稳定观察同一段轨迹。
+"""
+
+"""先启动 Isaac Sim 仿真程序。"""
 
 import argparse
 import json
@@ -9,7 +18,7 @@ import sys
 
 from isaaclab.app import AppLauncher
 
-# local imports
+# 本地脚本导入
 import cli_args  # isort: skip
 
 G1_CANONICAL_JOINT_NAMES = [
@@ -77,7 +86,7 @@ G1_CANONICAL_BODY_NAMES = [
     "right_wrist_yaw_link",
 ]
 
-# add argparse arguments
+# 本地 play 和视频录制使用的命令行参数。
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=5000, help="Length of the recorded video (in steps).")
@@ -109,23 +118,23 @@ parser.add_argument(
     help="Motion frame used for every episode reset. Use -1 to keep adaptive random start-frame sampling.",
 )
 parser.add_argument("--env_spacing", type=float, default=None, help="Environment spacing override.")
-# append RSL-RL cli arguments
+# 追加 RSL-RL 命令行参数
 cli_args.add_rsl_rl_args(parser)
-# append AppLauncher cli args
+# 追加 Isaac Sim AppLauncher 命令行参数
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
-# always enable cameras to record video
+# 录制视频时必须启用 camera
 if args_cli.video:
     args_cli.enable_cameras = True
 
-# clear out sys.argv for Hydra
+# 清理 sys.argv，避免 Hydra 解析到非 Hydra 参数
 sys.argv = [sys.argv[0]] + hydra_args
 
-# launch omniverse app
+# 启动 Omniverse / Isaac Sim app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-"""Rest everything follows."""
+"""Isaac Sim 启动后，再导入依赖仿真的模块。"""
 
 import gymnasium as gym
 import isaaclab.sim as sim_utils
@@ -148,18 +157,20 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
-# Import extensions to set up environment tasks
+# 导入扩展以注册环境任务
 import whole_body_tracking.tasks  # noqa: F401
 from whole_body_tracking.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
 
 
 def _yaw_quat_wxyz(yaw_deg: float) -> tuple[float, float, float, float]:
+    """把 manifest 里的 yaw 转成 USD/Isaac 使用的 WXYZ 四元数。"""
     yaw_rad = math.radians(float(yaw_deg))
     half_yaw = 0.5 * yaw_rad
     return (math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw))
 
 
 def _add_height_scan_terrain_target(env_cfg: ManagerBasedRLEnvCfg):
+    """让策略的高度扫描器看到插入的本地 terrain。"""
     height_scanner = getattr(env_cfg.scene, "height_scanner", None)
     if height_scanner is None or not hasattr(height_scanner.__class__, "RaycastTargetCfg"):
         return
@@ -178,6 +189,7 @@ def _add_height_scan_terrain_target(env_cfg: ManagerBasedRLEnvCfg):
 
 
 def _load_manifest_entry(manifest_file: str | None, motion_file: str) -> dict | None:
+    """加载 play 所用 motion 对应的 manifest 条目。"""
     if manifest_file is None:
         return None
 
@@ -210,6 +222,7 @@ def _load_manifest_entry(manifest_file: str | None, motion_file: str) -> dict | 
 
 
 def _get_skill_output_start_frame(manifest_entry: dict) -> int:
+    """找到生成技能真正开始执行的第一帧。"""
     for segment in manifest_entry.get("segments", []):
         if segment.get("mode") == "skill_execution":
             return int(segment["output_start_frame"])
@@ -217,6 +230,7 @@ def _get_skill_output_start_frame(manifest_entry: dict) -> int:
 
 
 def _rotate_xyz_by_yaw_deg(xyz: np.ndarray, yaw_deg: float) -> np.ndarray:
+    """把局部平移旋转到与 terrain yaw 对齐的世界坐标系。"""
     yaw_rad = np.deg2rad(float(yaw_deg))
     cos_yaw = np.cos(yaw_rad)
     sin_yaw = np.sin(yaw_rad)
@@ -233,6 +247,7 @@ def _rotate_xyz_by_yaw_deg(xyz: np.ndarray, yaw_deg: float) -> np.ndarray:
 def _compute_manifest_motion_offset(
     manifest_entry: dict, motion_file: str, root_body_idx: int, use_manifest_terrain_pose: bool
 ) -> tuple[float, float, float]:
+    """把 play 的参考动作对齐到 manifest 里的 skill anchor。"""
     data = np.load(motion_file)
     body_pos_w = np.asarray(data["body_pos_w"], dtype=np.float32)
     skill_output_start = _get_skill_output_start_frame(manifest_entry)
@@ -266,6 +281,7 @@ def _compute_manifest_motion_offset(
 def _add_manifest_terrain(
     env_cfg: ManagerBasedRLEnvCfg, terrain_file: str, manifest_entry: dict | None, use_manifest_pose: bool
 ):
+    """挂载训练时使用的同一个本地 terrain USD。"""
     terrain_path = os.path.abspath(terrain_file)
     if not os.path.isfile(terrain_path):
         raise FileNotFoundError(f"Invalid terrain file path: {terrain_path}")
@@ -294,6 +310,7 @@ def _add_manifest_terrain(
 
 
 def _use_fixed_motion_start(env_cfg: ManagerBasedRLEnvCfg, start_frame: int):
+    """关闭 reset 噪声，让 play 从确定帧开始。"""
     env_cfg.commands.motion.fixed_start_frame = start_frame
     env_cfg.commands.motion.pose_range = {
         "x": (0.0, 0.0),
@@ -316,6 +333,7 @@ def _use_fixed_motion_start(env_cfg: ManagerBasedRLEnvCfg, start_frame: int):
 
 
 def _disable_debug_visuals(env_cfg: ManagerBasedRLEnvCfg):
+    """关闭 marker/contact 调试显示，让 play 和视频画面更干净。"""
     if hasattr(env_cfg, "commands") and hasattr(env_cfg.commands, "motion"):
         env_cfg.commands.motion.debug_vis = False
     if hasattr(env_cfg.scene, "contact_forces") and env_cfg.scene.contact_forces is not None:
@@ -324,6 +342,7 @@ def _disable_debug_visuals(env_cfg: ManagerBasedRLEnvCfg):
 
 
 def _configure_motion(env_cfg: ManagerBasedRLEnvCfg, motion_file: str):
+    """设置本地 motion 文件，以及可选的 G1 canonical 源顺序。"""
     motion_path = os.path.abspath(motion_file)
     if not os.path.isfile(motion_path):
         raise FileNotFoundError(f"Invalid motion file path: {motion_path}")
@@ -336,12 +355,13 @@ def _configure_motion(env_cfg: ManagerBasedRLEnvCfg, motion_file: str):
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
-    """Play with RSL-RL agent."""
+    """使用 RSL-RL agent 播放 checkpoint。"""
+    # 加载训练时相同的 PPO 配置，再应用命令行里的 checkpoint/log 覆盖项。
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.scene.env_spacing = args_cli.env_spacing if args_cli.env_spacing is not None else env_cfg.scene.env_spacing
 
-    # specify directory for logging experiments
+    # 在 logs/rsl_rl/<experiment_name>/<load_run>/<checkpoint> 下定位 checkpoint。
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
 
@@ -372,12 +392,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     _disable_debug_visuals(env_cfg)
 
-    # create isaac environment
+    # 注入 motion/terrain 配置后再创建 Isaac 环境。
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
     log_dir = os.path.dirname(resume_path)
 
-    # wrap for video recording
+    # 如需录制视频，给环境包一层 RecordVideo
     if args_cli.video:
         video_kwargs = {
             "video_folder": os.path.join(log_dir, "videos", "play"),
@@ -389,18 +409,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
-    # convert to single-agent instance if required by the RL algorithm
+    # 如果任务是多 agent，转换成单 agent 形式给 RSL-RL 使用
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
-    # wrap around environment for rsl-rl
+    # 包装成 RSL-RL 需要的 VecEnv 接口
     env = RslRlVecEnvWrapper(env)
 
-    # load previously trained model
+    # 加载训练好的模型，并构建推理 policy。
     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     ppo_runner.load(resume_path)
 
-    # obtain the trained policy for inference
+    # 获取训练好的推理 policy
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
 
     try:
@@ -415,7 +435,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         normalizer = None
 
-    # export policy to onnx/jit
+    # play 启动时导出 ONNX，确保导出的模型和当前查看的 checkpoint 一致。
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
 
     export_motion_policy_as_onnx(
@@ -426,30 +446,30 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         filename="policy.onnx",
     )
     attach_onnx_metadata(env.unwrapped, "local", export_model_dir)
-    # reset environment
+    # reset 环境，并在 Isaac app 打开期间持续实时仿真。
     observations = env.get_observations()
     obs = observations[0] if isinstance(observations, tuple) else observations
     timestep = 0
-    # simulate environment
+    # 开始仿真循环
     while simulation_app.is_running():
-        # run everything in inference mode
+        # 推理阶段不需要梯度
         with torch.inference_mode():
-            # agent stepping
+            # policy 根据 observation 输出动作
             actions = policy(obs)
-            # env stepping
+            # 环境执行动作并返回下一帧 observation
             obs, _, _, _ = env.step(actions)
         if args_cli.video:
             timestep += 1
-            # Exit the play loop after recording one video
+            # 录完一个视频后退出 play 循环
             if timestep == args_cli.video_length:
                 break
 
-    # close the simulator
+    # 关闭仿真环境
     env.close()
 
 
 if __name__ == "__main__":
-    # run the main function
+    # 运行主函数
     main()
-    # close sim app
+    # 关闭 Isaac Sim app
     simulation_app.close()

@@ -1,4 +1,4 @@
-"""Configurations for velocity-based locomotion environments."""
+"""基于速度/轨迹跟踪的 locomotion 环境配置。"""
 
-# We leave this file empty since we don't want to expose any configs in this package directly.
-# We still need this file to import the "config" module in the parent package.
+# 这里不直接暴露具体配置；具体配置在下级包里注册。
+# 仍然保留此文件，是为了让父包可以正常导入 config 模块。

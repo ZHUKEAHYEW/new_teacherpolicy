@@ -3,7 +3,7 @@ import gymnasium as gym
 from . import agents, flat_env_cfg
 
 ##
-# Register Gym environments.
+# 注册 Gym 环境。
 ##
 
 gym.register(

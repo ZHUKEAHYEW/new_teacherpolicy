@@ -1,3 +1,13 @@
+"""在 Isaac Sim 中直接回放本地 npz 轨迹，不加载 policy。
+
+这个脚本用于检查数据本身：
+1. 读取 `.npz` 中的 body/joint 轨迹。
+2. 按 manifest/terrain 对齐到世界坐标。
+3. 直接把机器人状态逐帧写入仿真。
+
+如果 replay 里轨迹本身不对，训练和 play 大概率也会出现对应问题。
+"""
+
 import argparse
 import json
 import pathlib
@@ -10,7 +20,7 @@ from isaaclab.app import AppLauncher
 
 import cli_args  # isort: skip
 
-# ===== npz 导出时的 canonical joint 顺序 =====
+# npz 导出时的 canonical joint 顺序。replay 时会按机器人实际关节顺序重排。
 NPZ_JOINT_NAMES = [
     "left_hip_pitch_joint",
     "left_hip_roll_joint",
@@ -45,6 +55,7 @@ NPZ_JOINT_NAMES = [
 
 
 def reorder_joint_array(joint_arr: np.ndarray, src_joint_names: list[str], dst_joint_names: list[str]) -> np.ndarray:
+    """把形状为 [T, J] 的关节数组从 npz 顺序重排成仿真机器人顺序。"""
     src_index = {name: i for i, name in enumerate(src_joint_names)}
     out = np.zeros((joint_arr.shape[0], len(dst_joint_names)), dtype=joint_arr.dtype)
 
@@ -62,12 +73,14 @@ def reorder_joint_array(joint_arr: np.ndarray, src_joint_names: list[str], dst_j
 
 
 def quat_wxyz_from_yaw_deg(yaw_deg: float) -> np.ndarray:
+    """根据 yaw 角构造 WXYZ 四元数。"""
     yaw_rad = np.deg2rad(float(yaw_deg))
     half = 0.5 * yaw_rad
     return np.array([np.cos(half), 0.0, 0.0, np.sin(half)], dtype=np.float32)
 
 
 def rotate_xyz_by_yaw_deg(xyz: np.ndarray, yaw_deg: float) -> np.ndarray:
+    """绕 z 轴旋转 xyz；manifest terrain 带 yaw 时使用。"""
     yaw_rad = np.deg2rad(float(yaw_deg))
     cos_yaw = np.cos(yaw_rad)
     sin_yaw = np.sin(yaw_rad)
@@ -82,6 +95,7 @@ def rotate_xyz_by_yaw_deg(xyz: np.ndarray, yaw_deg: float) -> np.ndarray:
 
 
 def load_manifest_entry(manifest_path: pathlib.Path, motion_file: pathlib.Path):
+    """找到与当前回放 motion 文件匹配的 manifest 条目。"""
     if not manifest_path.exists():
         print(f"[WARN] Manifest not found: {manifest_path}")
         return None
@@ -189,6 +203,7 @@ def set_xformable_prim_pose(stage, prim_path: str, translation_xyz: np.ndarray, 
     )
 
 
+# replay 有自己的参数；之后再追加 app/rsl-rl 参数以兼容 Isaac Lab。
 parser = argparse.ArgumentParser(description="Replay local npz trajectory in Isaac Sim.")
 parser.add_argument("--task", type=str, required=True, help="Task name, e.g. Tracking-Flat-G1-v0")
 parser.add_argument("--motion_file", type=str, required=True, help="Local npz motion file")
@@ -232,6 +247,7 @@ import whole_body_tracking.tasks  # noqa: F401
 
 
 def add_terrain_asset(env_cfg: ManagerBasedRLEnvCfg, terrain_file: str, manifest_entry, use_manifest_pose: bool):
+    """给 replay 场景挂载 terrain USD，可选择使用 manifest 位姿。"""
     terrain_path = pathlib.Path(terrain_file).resolve()
     if not terrain_path.exists():
         raise FileNotFoundError(f"Terrain file not found: {terrain_path}")
@@ -264,6 +280,7 @@ def add_terrain_asset(env_cfg: ManagerBasedRLEnvCfg, terrain_file: str, manifest
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg):
+    """加载 npz 数据，并把每一帧直接写入仿真机器人。"""
     motion_path = pathlib.Path(args_cli.motion_file).resolve()
     if not motion_path.exists():
         raise FileNotFoundError(f"Motion file not found: {motion_path}")
@@ -275,6 +292,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     manifest_entry = load_manifest_entry(manifest_path, motion_path)
 
+    # 加载原始轨迹数组。replay 特意不使用 policy，只检查数据本身。
     data = np.load(motion_path, allow_pickle=True)
     print("NPZ keys:", data.files)
 
@@ -307,6 +325,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if "terrain_world_pose" in manifest_entry:
             print(f"[INFO] Manifest terrain pose    : {manifest_entry['terrain_world_pose']}")
 
+    # 创建同一个任务场景；这里的 policy command 只用于实例化配置。
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.commands.motion.motion_file = str(motion_path)
     if args_cli.terrain_file:
@@ -326,6 +345,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     robot = env.unwrapped.scene["robot"]
     device = robot.device
 
+    # IsaacLab 关节顺序可能和导出的 npz 顺序不同，所以写入前必须重排。
     robot_joint_names = list(robot.data.joint_names)
     print("[INFO] Robot joint order:")
     for i, name in enumerate(robot_joint_names):
@@ -370,6 +390,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     elif args_cli.apply_manifest_terrain_pose:
         print("[WARN] --apply_manifest_terrain_pose enabled, but manifest entry or terrain_world_pose missing.")
 
+    # `--fps` 控制肉眼看到的回放速度；`replay_fps` 只用于打印和检查数据。
     replay_fps = float(np.asarray(data["fps"]).reshape(-1)[0]) if "fps" in data.files else float(args_cli.fps)
     sleep_dt = 1.0 / float(args_cli.fps)
 

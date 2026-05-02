@@ -1,4 +1,4 @@
-"""This sub-module contains the functions that are specific to the locomotion environments."""
+"""这个子模块包含 locomotion/tracking 环境专用的 MDP 函数。"""
 
 from isaaclab.envs.mdp import *  # noqa: F401, F403
 

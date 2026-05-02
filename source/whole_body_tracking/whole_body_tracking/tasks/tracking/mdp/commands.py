@@ -1,3 +1,13 @@
+"""训练和 play 使用的 motion command 实现。
+
+这个文件是轨迹跟踪任务的核心：
+1. `MotionLoader` 读取单个 `.npz` 参考轨迹，并按机器人关节/body 顺序重排。
+2. `MotionCollection` 管理一组轨迹，支持多轨迹训练时每个并行环境独立选择轨迹。
+3. `MotionCommand` 在每个仿真 step 生成目标关节、目标 body 位姿、误差指标和 reset 初始状态。
+
+训练中机器人不是直接执行 `.npz`，而是把 `.npz` 作为 command/reward 参考，让 PPO 学出可控策略。
+"""
+
 from __future__ import annotations
 
 import math
@@ -36,6 +46,12 @@ def _indices_from_names(source_names: Sequence[str], target_names: Sequence[str]
 
 
 class MotionLoader:
+    """读取并采样单个 motion `.npz` 文件。
+
+    `.npz` 中的关键数组包括 joint_pos/joint_vel/body_pos_w/body_quat_w/body velocity。
+    训练时控制频率和轨迹 fps 不一定一致，所以这里提供线性插值采样。
+    """
+
     def __init__(
         self,
         motion_file: str,
@@ -64,6 +80,7 @@ class MotionLoader:
         self.time_step_total = self.joint_pos.shape[0]
 
     def _sample_linear(self, values: torch.Tensor, frame_times: torch.Tensor) -> torch.Tensor:
+        """在小数帧位置对 tensor 做线性插值。"""
         frame_times = torch.clamp(frame_times, 0.0, float(self.time_step_total - 1))
         frame_floor = frame_times.floor().long()
         frame_ceil = torch.clamp(frame_floor + 1, max=self.time_step_total - 1)
@@ -71,6 +88,11 @@ class MotionLoader:
         return values[frame_floor] * (1.0 - blend) + values[frame_ceil] * blend
 
     def _sample_quat(self, values: torch.Tensor, frame_times: torch.Tensor) -> torch.Tensor:
+        """插值四元数，并对结果归一化。
+
+        这里使用 normalized linear interpolation，并在插值前处理四元数正负号，
+        避免同一个旋转因为符号相反导致插值绕远路。
+        """
         frame_times = torch.clamp(frame_times, 0.0, float(self.time_step_total - 1))
         frame_floor = frame_times.floor().long()
         frame_ceil = torch.clamp(frame_floor + 1, max=self.time_step_total - 1)
@@ -115,7 +137,113 @@ class MotionLoader:
         return self._body_ang_vel_w[:, self._body_indexes]
 
 
+class MotionCollection:
+    """一个或多个兼容 motion 文件的容器。
+
+    多轨迹训练时 `active_motion_ids[env_id]` 指明每个并行环境正在跟踪哪条轨迹。
+    所有轨迹必须有相同的关节维度和 tracked body 维度，否则 observation/reward 维度会变化。
+    """
+
+    def __init__(
+        self,
+        motion_files: Sequence[str],
+        body_indexes: Sequence[int],
+        device: str = "cpu",
+        joint_indexes: Sequence[int] | None = None,
+        position_offsets: Sequence[Sequence[float] | None] | None = None,
+    ):
+        if not motion_files:
+            raise ValueError("At least one motion file must be provided.")
+        if position_offsets is None:
+            position_offsets = [None] * len(motion_files)
+        if len(position_offsets) != len(motion_files):
+            raise ValueError("motion_position_offsets must have the same length as motion_files.")
+
+        self.motions = [
+            MotionLoader(
+                motion_file,
+                body_indexes,
+                device=device,
+                joint_indexes=joint_indexes,
+                position_offset=position_offset,
+            )
+            for motion_file, position_offset in zip(motion_files, position_offsets)
+        ]
+        self.num_motions = len(self.motions)
+        self.time_step_totals = torch.tensor(
+            [motion.time_step_total for motion in self.motions], dtype=torch.long, device=device
+        )
+        self.fps = torch.tensor([motion.fps for motion in self.motions], dtype=torch.float32, device=device)
+        self.max_time_step_total = int(self.time_step_totals.max().item())
+        self.max_duration_s = max(motion.time_step_total / motion.fps for motion in self.motions)
+
+        joint_dim = self.motions[0].joint_pos.shape[1]
+        body_dim = self.motions[0].body_pos_w.shape[1]
+        for motion in self.motions:
+            if motion.joint_pos.shape[1] != joint_dim:
+                raise ValueError("All motions must have the same joint dimension after reordering.")
+            if motion.body_pos_w.shape[1] != body_dim:
+                raise ValueError("All motions must have the same tracked body dimension after reordering.")
+
+    # 这些属性用于兼容旧的单轨迹工具，特别是 ONNX 导出。
+    # 多轨迹时把第一条轨迹作为代表轨迹暴露出去。
+    @property
+    def joint_pos(self) -> torch.Tensor:
+        return self.motions[0].joint_pos
+
+    @property
+    def joint_vel(self) -> torch.Tensor:
+        return self.motions[0].joint_vel
+
+    @property
+    def body_pos_w(self) -> torch.Tensor:
+        return self.motions[0].body_pos_w
+
+    @property
+    def body_quat_w(self) -> torch.Tensor:
+        return self.motions[0].body_quat_w
+
+    @property
+    def body_lin_vel_w(self) -> torch.Tensor:
+        return self.motions[0].body_lin_vel_w
+
+    @property
+    def body_ang_vel_w(self) -> torch.Tensor:
+        return self.motions[0].body_ang_vel_w
+
+    def _sample(self, method_name: str, motion_ids: torch.Tensor, frame_times: torch.Tensor) -> torch.Tensor:
+        """让每个并行环境从自己当前 active motion 中采样。"""
+        sample0 = getattr(self.motions[0], method_name)(frame_times[:1])
+        output = torch.empty((len(frame_times), *sample0.shape[1:]), dtype=sample0.dtype, device=sample0.device)
+        for motion_id, motion in enumerate(self.motions):
+            env_ids = torch.where(motion_ids == motion_id)[0]
+            if len(env_ids) == 0:
+                continue
+            output[env_ids] = getattr(motion, method_name)(frame_times[env_ids])
+        return output
+
+    def sample_joint_pos(self, motion_ids: torch.Tensor, frame_times: torch.Tensor) -> torch.Tensor:
+        return self._sample("sample_joint_pos", motion_ids, frame_times)
+
+    def sample_joint_vel(self, motion_ids: torch.Tensor, frame_times: torch.Tensor) -> torch.Tensor:
+        return self._sample("sample_joint_vel", motion_ids, frame_times)
+
+    def sample_body_pos_w(self, motion_ids: torch.Tensor, frame_times: torch.Tensor) -> torch.Tensor:
+        return self._sample("sample_body_pos_w", motion_ids, frame_times)
+
+    def sample_body_quat_w(self, motion_ids: torch.Tensor, frame_times: torch.Tensor) -> torch.Tensor:
+        return self._sample("sample_body_quat_w", motion_ids, frame_times)
+
+    def sample_body_lin_vel_w(self, motion_ids: torch.Tensor, frame_times: torch.Tensor) -> torch.Tensor:
+        return self._sample("sample_body_lin_vel_w", motion_ids, frame_times)
+
+    def sample_body_ang_vel_w(self, motion_ids: torch.Tensor, frame_times: torch.Tensor) -> torch.Tensor:
+        return self._sample("sample_body_ang_vel_w", motion_ids, frame_times)
+
+
 class MotionCommand(CommandTerm):
+    """Isaac Lab command term：把参考动作转成跟踪目标。"""
+
     cfg: MotionCommandCfg
 
     def __init__(self, cfg: MotionCommandCfg, env: ManagerBasedRLEnv):
@@ -145,33 +273,42 @@ class MotionCommand(CommandTerm):
                 "joint",
             )
 
-        self.motion = MotionLoader(
-            self.cfg.motion_file,
+        # `motion_file` 保留给单轨迹兼容；`motion_files` 用于多轨迹训练。
+        motion_files = list(self.cfg.motion_files) if self.cfg.motion_files is not None else [self.cfg.motion_file]
+        position_offsets = (
+            list(self.cfg.motion_position_offsets)
+            if self.cfg.motion_position_offsets is not None
+            else [self.cfg.motion_position_offset] * len(motion_files)
+        )
+        self.motion = MotionCollection(
+            motion_files,
             motion_body_indexes,
             device=self.device,
             joint_indexes=motion_joint_indexes,
-            position_offset=self.cfg.motion_position_offset,
+            position_offsets=position_offsets,
         )
         if self.cfg.fixed_start_frame is not None:
-            if self.cfg.fixed_start_frame < 0 or self.cfg.fixed_start_frame >= self.motion.time_step_total:
+            min_motion_length = int(self.motion.time_step_totals.min().item())
+            if self.cfg.fixed_start_frame < 0 or self.cfg.fixed_start_frame >= min_motion_length:
                 raise ValueError(
                     f"fixed_start_frame={self.cfg.fixed_start_frame} is outside motion length "
-                    f"{self.motion.time_step_total}."
+                    f"{min_motion_length}."
                 )
-        self.motion_frame_step = self.motion.fps * env.cfg.decimation * env.cfg.sim.dt
+        self.motion_frame_steps = self.motion.fps * env.cfg.decimation * env.cfg.sim.dt
+        self.active_motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.time_step_f = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         print(
             "[INFO]: Motion timing: "
-            f"motion_fps={self.motion.fps:.3f}, control_dt={env.cfg.decimation * env.cfg.sim.dt:.4f}s, "
-            f"motion_frames_per_control_step={self.motion_frame_step:.3f}"
+            f"num_motions={self.motion.num_motions}, control_dt={env.cfg.decimation * env.cfg.sim.dt:.4f}s, "
+            f"fps_range=({self.motion.fps.min().item():.3f}, {self.motion.fps.max().item():.3f}), "
+            f"frame_step_range=({self.motion_frame_steps.min().item():.3f}, {self.motion_frame_steps.max().item():.3f})"
         )
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
         self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)
         self.body_quat_relative_w[:, :, 0] = 1.0
 
-        motion_duration_s = self.motion.time_step_total / self.motion.fps
-        self.bin_count = int(motion_duration_s) + 1
+        self.bin_count = int(self.motion.max_duration_s) + 1
         self.bin_failed_count = torch.zeros(self.bin_count, dtype=torch.float, device=self.device)
         self._current_bin_failed = torch.zeros(self.bin_count, dtype=torch.float, device=self.device)
         self.kernel = torch.tensor(
@@ -192,51 +329,61 @@ class MotionCommand(CommandTerm):
         self.metrics["sampling_top1_bin"] = torch.zeros(self.num_envs, device=self.device)
 
     @property
-    def command(self) -> torch.Tensor:  # TODO Consider again if this is the best observation
+    def command(self) -> torch.Tensor:  # TODO: 之后可以评估这是否仍是最合适的 policy 输入形式。
+        # policy 接收当前参考帧的目标关节位置和目标关节速度。
         return torch.cat([self.joint_pos, self.joint_vel], dim=1)
 
     @property
     def joint_pos(self) -> torch.Tensor:
-        return self.motion.sample_joint_pos(self.time_step_f)
+        return self.motion.sample_joint_pos(self.active_motion_ids, self.time_step_f)
 
     @property
     def joint_vel(self) -> torch.Tensor:
-        return self.motion.sample_joint_vel(self.time_step_f)
+        return self.motion.sample_joint_vel(self.active_motion_ids, self.time_step_f)
 
     @property
     def body_pos_w(self) -> torch.Tensor:
-        return self.motion.sample_body_pos_w(self.time_step_f) + self._env.scene.env_origins[:, None, :]
+        return (
+            self.motion.sample_body_pos_w(self.active_motion_ids, self.time_step_f)
+            + self._env.scene.env_origins[:, None, :]
+        )
 
     @property
     def body_quat_w(self) -> torch.Tensor:
-        return self.motion.sample_body_quat_w(self.time_step_f)
+        return self.motion.sample_body_quat_w(self.active_motion_ids, self.time_step_f)
 
     @property
     def body_lin_vel_w(self) -> torch.Tensor:
-        return self.motion.sample_body_lin_vel_w(self.time_step_f)
+        return self.motion.sample_body_lin_vel_w(self.active_motion_ids, self.time_step_f)
 
     @property
     def body_ang_vel_w(self) -> torch.Tensor:
-        return self.motion.sample_body_ang_vel_w(self.time_step_f)
+        return self.motion.sample_body_ang_vel_w(self.active_motion_ids, self.time_step_f)
 
     @property
     def anchor_pos_w(self) -> torch.Tensor:
         return (
-            self.motion.sample_body_pos_w(self.time_step_f)[:, self.motion_anchor_body_index]
+            self.motion.sample_body_pos_w(self.active_motion_ids, self.time_step_f)[:, self.motion_anchor_body_index]
             + self._env.scene.env_origins
         )
 
     @property
     def anchor_quat_w(self) -> torch.Tensor:
-        return self.motion.sample_body_quat_w(self.time_step_f)[:, self.motion_anchor_body_index]
+        return self.motion.sample_body_quat_w(self.active_motion_ids, self.time_step_f)[
+            :, self.motion_anchor_body_index
+        ]
 
     @property
     def anchor_lin_vel_w(self) -> torch.Tensor:
-        return self.motion.sample_body_lin_vel_w(self.time_step_f)[:, self.motion_anchor_body_index]
+        return self.motion.sample_body_lin_vel_w(self.active_motion_ids, self.time_step_f)[
+            :, self.motion_anchor_body_index
+        ]
 
     @property
     def anchor_ang_vel_w(self) -> torch.Tensor:
-        return self.motion.sample_body_ang_vel_w(self.time_step_f)[:, self.motion_anchor_body_index]
+        return self.motion.sample_body_ang_vel_w(self.active_motion_ids, self.time_step_f)[
+            :, self.motion_anchor_body_index
+        ]
 
     @property
     def robot_joint_pos(self) -> torch.Tensor:
@@ -279,6 +426,7 @@ class MotionCommand(CommandTerm):
         return self.robot.data.body_ang_vel_w[:, self.robot_anchor_body_index]
 
     def _update_metrics(self):
+        """保存可解释的跟踪误差，供日志和 debug 使用。"""
         self.metrics["error_anchor_pos"] = torch.norm(self.anchor_pos_w - self.robot_anchor_pos_w, dim=-1)
         self.metrics["error_anchor_rot"] = quat_error_magnitude(self.anchor_quat_w, self.robot_anchor_quat_w)
         self.metrics["error_anchor_lin_vel"] = torch.norm(self.anchor_lin_vel_w - self.robot_anchor_lin_vel_w, dim=-1)
@@ -302,19 +450,38 @@ class MotionCommand(CommandTerm):
         self.metrics["error_joint_vel"] = torch.norm(self.joint_vel - self.robot_joint_vel, dim=-1)
 
     def _adaptive_sampling(self, env_ids: Sequence[int]):
+        """为 reset 选择起始帧。
+
+        单轨迹时保留原来的 failure-adaptive bin 采样；
+        多轨迹时先均匀选择轨迹，再在对应轨迹长度内均匀选择起始帧。
+        """
+        if self.motion.num_motions > 1:
+            self.active_motion_ids[env_ids] = torch.randint(
+                self.motion.num_motions, (len(env_ids),), dtype=torch.long, device=self.device
+            )
+            motion_lengths = self.motion.time_step_totals[self.active_motion_ids[env_ids]].float()
+            self.time_step_f[env_ids] = sample_uniform(0.0, 1.0, (len(env_ids),), device=self.device) * (
+                motion_lengths - 1.0
+            )
+            self.time_steps[env_ids] = self.time_step_f[env_ids].long()
+            self.metrics["sampling_entropy"][:] = 1.0
+            self.metrics["sampling_top1_prob"][:] = 1.0 / self.motion.num_motions
+            self.metrics["sampling_top1_bin"][:] = 0.0
+            return
+
         episode_failed = self._env.termination_manager.terminated[env_ids]
         if torch.any(episode_failed):
             current_bin_index = torch.clamp(
-                (self.time_step_f * self.bin_count / max(self.motion.time_step_total, 1)), 0, self.bin_count - 1
+                (self.time_step_f * self.bin_count / max(self.motion.max_time_step_total, 1)), 0, self.bin_count - 1
             )
             fail_bins = current_bin_index.long()[env_ids][episode_failed]
             self._current_bin_failed[:] = torch.bincount(fail_bins, minlength=self.bin_count)
 
-        # Sample
+        # 采样起始 bin
         sampling_probabilities = self.bin_failed_count + self.cfg.adaptive_uniform_ratio / float(self.bin_count)
         sampling_probabilities = torch.nn.functional.pad(
             sampling_probabilities.unsqueeze(0).unsqueeze(0),
-            (0, self.cfg.adaptive_kernel_size - 1),  # Non-causal kernel
+            (0, self.cfg.adaptive_kernel_size - 1),  # 非因果卷积核
             mode="replicate",
         )
         sampling_probabilities = torch.nn.functional.conv1d(sampling_probabilities, self.kernel.view(1, 1, -1)).view(-1)
@@ -326,11 +493,11 @@ class MotionCommand(CommandTerm):
         self.time_step_f[env_ids] = (
             (sampled_bins + sample_uniform(0.0, 1.0, (len(env_ids),), device=self.device))
             / self.bin_count
-            * (self.motion.time_step_total - 1)
+            * (self.motion.max_time_step_total - 1)
         )
         self.time_steps[env_ids] = self.time_step_f[env_ids].long()
 
-        # Metrics
+        # 记录采样分布指标
         H = -(sampling_probabilities * (sampling_probabilities + 1e-12).log()).sum()
         H_norm = H / math.log(self.bin_count)
         pmax, imax = sampling_probabilities.max(dim=0)
@@ -339,16 +506,21 @@ class MotionCommand(CommandTerm):
         self.metrics["sampling_top1_bin"][:] = imax.float() / self.bin_count
 
     def _resample_command(self, env_ids: Sequence[int]):
+        """把选中的环境 reset 到参考姿态，并叠加配置中的随机扰动。"""
         if len(env_ids) == 0:
             return
         if self.cfg.fixed_start_frame is None:
             self._adaptive_sampling(env_ids)
         else:
+            if self.motion.num_motions > 1:
+                self.active_motion_ids[env_ids] = torch.randint(
+                    self.motion.num_motions, (len(env_ids),), dtype=torch.long, device=self.device
+                )
             self.time_steps[env_ids] = self.cfg.fixed_start_frame
             self.time_step_f[env_ids] = float(self.cfg.fixed_start_frame)
             self.metrics["sampling_entropy"][:] = 0.0
             self.metrics["sampling_top1_prob"][:] = 1.0
-            self.metrics["sampling_top1_bin"][:] = float(self.cfg.fixed_start_frame) / self.motion.time_step_total
+            self.metrics["sampling_top1_bin"][:] = float(self.cfg.fixed_start_frame) / self.motion.max_time_step_total
 
         root_pos = self.body_pos_w[:, 0].clone()
         root_ori = self.body_quat_w[:, 0].clone()
@@ -382,9 +554,11 @@ class MotionCommand(CommandTerm):
         )
 
     def _update_command(self):
-        self.time_step_f += self.motion_frame_step
-        self.time_steps = torch.clamp(self.time_step_f.long(), max=self.motion.time_step_total - 1)
-        env_ids = torch.where(self.time_step_f >= self.motion.time_step_total - 1)[0]
+        """推进参考帧，并刷新相对目标 body 位姿。"""
+        self.time_step_f += self.motion_frame_steps[self.active_motion_ids]
+        motion_lengths = self.motion.time_step_totals[self.active_motion_ids]
+        self.time_steps = torch.minimum(self.time_step_f.long(), motion_lengths - 1)
+        env_ids = torch.where(self.time_step_f >= motion_lengths.float() - 1.0)[0]
         self._resample_command(env_ids)
 
         anchor_pos_w_repeat = self.anchor_pos_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
@@ -456,18 +630,24 @@ class MotionCommand(CommandTerm):
 
 @configclass
 class MotionCommandCfg(CommandTermCfg):
-    """Configuration for the motion command."""
+    """motion command 的配置。
+
+    `motion_file`/`motion_position_offset` 是单轨迹接口；
+    `motion_files`/`motion_position_offsets` 是多轨迹接口，长度必须互相匹配。
+    """
 
     class_type: type = MotionCommand
 
     asset_name: str = MISSING
 
     motion_file: str = MISSING
+    motion_files: list[str] | None = None
     anchor_body_name: str = MISSING
     body_names: list[str] = MISSING
     source_joint_names: list[str] | None = None
     source_body_names: list[str] | None = None
     motion_position_offset: tuple[float, float, float] | None = None
+    motion_position_offsets: list[tuple[float, float, float] | None] | None = None
     fixed_start_frame: int | None = None
 
     pose_range: dict[str, tuple[float, float]] = {}

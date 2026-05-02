@@ -1,13 +1,13 @@
-"""Package containing task implementations for various robotic environments."""
+"""机器人环境任务实现包。"""
 
 from isaaclab_tasks.utils import import_packages
 
 ##
-# Register Gym environments.
+# 注册 Gym 环境。
 ##
 
 
-# The blacklist is used to prevent importing configs from sub-packages
+# blacklist 用于避免从子包导入配置。
 _BLACKLIST_PKGS = ["utils"]
-# Import all configs in this package
+# 导入当前包中的所有配置。
 import_packages(__name__, _BLACKLIST_PKGS)
