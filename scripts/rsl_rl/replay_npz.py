@@ -16,6 +16,11 @@ import time
 import numpy as np
 import torch
 
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+PACKAGE_ROOT = REPO_ROOT / "source" / "whole_body_tracking"
+if str(PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_ROOT))
+
 from isaaclab.app import AppLauncher
 
 import cli_args  # isort: skip

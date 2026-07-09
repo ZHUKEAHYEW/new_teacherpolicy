@@ -19,13 +19,20 @@
 import argparse
 import json
 import math
+import pathlib
 import pickle
 import sys
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+PACKAGE_ROOT = REPO_ROOT / "source" / "whole_body_tracking"
+if str(PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_ROOT))
 
 from isaaclab.app import AppLauncher
 
 # 本地脚本导入
 import cli_args  # isort: skip
+import dataset_args  # isort: skip
 
 G1_CANONICAL_JOINT_NAMES = [
     "left_hip_pitch_joint",
@@ -126,12 +133,14 @@ parser.add_argument(
     help="Motion frame used for every episode reset. Use -1 to keep adaptive random start-frame sampling.",
 )
 parser.add_argument("--env_spacing", type=float, default=None, help="Environment spacing override.")
+dataset_args.add_dataset_args(parser)
 
 # 追加 RSL-RL 命令行参数
 cli_args.add_rsl_rl_args(parser)
 # 追加 Isaac Sim AppLauncher 命令行参数
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+dataset_args.apply_dataset_defaults(args_cli, mode="train")
 
 # 录制视频时必须启用 camera
 if args_cli.video:
