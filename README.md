@@ -40,9 +40,13 @@ or
 python scripts/rsl_rl/train.py --simple climb_15_z_scale_1.0
 ```
 默认参数：
+
 `task=Tracking-Flat-G1-v0`（G1Task）
+
 `--max_iterations 20000`（20k iterations）
+
 `--headless` （无头）
+
 `--logger tensorboard` （数据可视化）
 
 
