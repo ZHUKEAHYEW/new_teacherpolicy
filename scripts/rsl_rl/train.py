@@ -126,13 +126,22 @@ parser.add_argument(
     help="Spawn --terrain_file at manifest terrain_world_pose instead of the origin.",
 )
 parser.add_argument("--motion_root_body_idx", type=int, default=0, help="Root body index used for manifest alignment.")
-parser.add_argument(
-    "--fixed_start_frame",
-    type=int,
-    default=-1,
-    help="Motion frame used for every episode reset. Use -1 to keep adaptive random start-frame sampling.",
+parser.add_argument("--env_spacing", type=float, default=10.0, help="Environment spacing override.")
+shortcut_group = parser.add_mutually_exclusive_group()
+shortcut_group.add_argument(
+    "--multi",
+    type=str,
+    default=None,
+    metavar="DATASET",
+    help="Shortcut for multi-trajectory training under data/DATASET.",
 )
-parser.add_argument("--env_spacing", type=float, default=None, help="Environment spacing override.")
+shortcut_group.add_argument(
+    "--simple",
+    type=str,
+    default=None,
+    metavar="DATASET",
+    help="Shortcut for single-trajectory training using the first npz under data/DATASET.",
+)
 dataset_args.add_dataset_args(parser)
 
 # 追加 RSL-RL 命令行参数
@@ -140,6 +149,24 @@ cli_args.add_rsl_rl_args(parser)
 # 追加 Isaac Sim AppLauncher 命令行参数
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+
+if args_cli.multi is not None or args_cli.simple is not None:
+    shortcut_name = args_cli.multi if args_cli.multi is not None else args_cli.simple
+    dataset_root = REPO_ROOT / "data"
+    if args_cli.dataset_dir is None:
+        args_cli.dataset_dir = str(dataset_root)
+    if args_cli.dataset_name is None:
+        args_cli.dataset_name = shortcut_name
+    if args_cli.task is None:
+        args_cli.task = "Tracking-Flat-G1-v0"
+    if args_cli.max_iterations is None:
+        args_cli.max_iterations = 20000
+    if args_cli.logger is None:
+        args_cli.logger = "tensorboard"
+    args_cli.headless = True
+    if args_cli.simple is not None and args_cli.dataset_motion_index is None:
+        args_cli.dataset_motion_index = 0
+
 dataset_args.apply_dataset_defaults(args_cli, mode="train")
 
 # 录制视频时必须启用 camera
@@ -348,33 +375,6 @@ def _add_manifest_terrain(
         print(f"[INFO]: Terrain pose: pos={terrain_pos}, yaw_deg={float(yaw_deg)}")
 
 
-def _use_fixed_motion_start(env_cfg: ManagerBasedRLEnvCfg, start_frame: int):
-    """强制每次 reset 都从同一个参考帧开始。
-
-    这适合确定性 debug/play。正常训练应保持 `--fixed_start_frame -1`，
-    让策略看到更多起始状态。
-    """
-    env_cfg.commands.motion.fixed_start_frame = start_frame
-    env_cfg.commands.motion.pose_range = {
-        "x": (0.0, 0.0),
-        "y": (0.0, 0.0),
-        "z": (0.0, 0.0),
-        "roll": (0.0, 0.0),
-        "pitch": (0.0, 0.0),
-        "yaw": (0.0, 0.0),
-    }
-    env_cfg.commands.motion.velocity_range = {
-        "x": (0.0, 0.0),
-        "y": (0.0, 0.0),
-        "z": (0.0, 0.0),
-        "roll": (0.0, 0.0),
-        "pitch": (0.0, 0.0),
-        "yaw": (0.0, 0.0),
-    }
-    env_cfg.commands.motion.joint_position_range = (0.0, 0.0)
-    print(f"[INFO]: Fixed motion reset frame: {start_frame}")
-
-
 def _resolve_motion_files() -> list[str]:
     """从 --motion_file、--motion_files、--motion_dir 收集动作文件。
 
@@ -461,9 +461,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # 当前环境每次运行只支持一个 terrain USD。多轨迹时使用第一个匹配 manifest 条目的 terrain pose。
         terrain_manifest_entry = next((entry for entry in manifest_entries if entry is not None), None)
         _add_manifest_terrain(env_cfg, args_cli.terrain_file, terrain_manifest_entry, args_cli.terrain_use_manifest_pose)
-
-    if args_cli.fixed_start_frame >= 0:
-        _use_fixed_motion_start(env_cfg, args_cli.fixed_start_frame)
 
     # 设置实验日志根目录
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)

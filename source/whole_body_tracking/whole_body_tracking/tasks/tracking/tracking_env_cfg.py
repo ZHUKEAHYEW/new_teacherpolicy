@@ -367,7 +367,7 @@ class TrackingEnvCfg(ManagerBasedRLEnvCfg):
     """locomotion velocity-tracking 环境配置。"""
 
     # 默认并行环境数较高，用于快速收集 PPO 数据；显存不足时用 --num_envs 覆盖。
-    scene: MySceneCfg = MySceneCfg(num_envs=16384, env_spacing=2.5)
+    scene: MySceneCfg = MySceneCfg(num_envs=16384, env_spacing=10.0)
     # 基础设置
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()

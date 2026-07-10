@@ -56,6 +56,21 @@ conda run -n isaaclab python scripts/rsl_rl/train.py \
   --max_iterations 10000
 ```
 
+## Round 5 - add shortcut launchers for multi/simple training
+
+- Change: add `--multi DATASET` and `--simple DATASET` to `scripts/rsl_rl/train.py`.
+- Behavior:
+  - `--multi climb_08_z_scale_1.0` resolves to `data/climb_08_z_scale_1.0/` and loads all `tracking/*.npz`.
+  - `--simple climb_08_z_scale_1.0` resolves to the same dataset but uses the first sorted `tracking/*.npz`.
+- Default values applied by the shortcut:
+  - `--task Tracking-Flat-G1-v0`
+  - `--max_iterations 20000`
+  - `--headless`
+  - `--logger tensorboard`
+- Existing lower-level arguments are still honored when explicitly provided.
+- Related defaults:
+  - `env_spacing` now defaults to `10.0` in both `train.py` and the task config.
+
 ## Round 4 - user-confirmed live training
 
 - Status: starting now.
