@@ -186,10 +186,10 @@ python scripts/rsl_rl/play.py \
   --task=Tracking-Flat-G1-v0 \
   --num_envs=1 \
   --dataset_dir data \
-  --dataset_name climb_15_z_scale_1.0 \
+  --dataset_name climb_08_z_scale_1.0 \
   --dataset_motion_index 0 \
-  --load_run 2026-05-01_15-36-06_climb_15_high_jump \
-  --checkpoint model_10000.pt
+  --load_run 2026-07-13_14-24-09_climb_08_multi-final\
+  --checkpoint model_8000.pt
 ```
 
 播放结构化数据集中的某条轨迹：

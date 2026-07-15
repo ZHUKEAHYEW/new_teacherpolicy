@@ -25,6 +25,7 @@ class G1FlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     policy = RslRlPpoActorCriticCfg(
         # 训练初期加在动作上的探索噪声。
         init_noise_std=1.0,
+        noise_std_type="log",
         actor_hidden_dims=[512, 256, 128],
         critic_hidden_dims=[512, 256, 128],
         activation="elu",
