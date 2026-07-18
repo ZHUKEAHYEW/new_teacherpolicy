@@ -19,7 +19,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg, MultiMeshRayCasterCfg, patterns
-from isaaclab.terrains import TerrainImporterCfg
+from isaaclab.terrains import MeshPlaneTerrainCfg, TerrainGeneratorCfg, TerrainImporterCfg
 
 ##
 # 预定义配置
@@ -34,12 +34,12 @@ import whole_body_tracking.tasks.tracking.mdp as mdp
 ##
 
 VELOCITY_RANGE = {
-    "x": (-0.5, 0.5),
-    "y": (-0.5, 0.5),
-    "z": (-0.2, 0.2),
-    "roll": (-0.52, 0.52),
-    "pitch": (-0.52, 0.52),
-    "yaw": (-0.78, 0.78),
+    "x": (-0.1, 0.1),
+    "y": (-0.1, 0.1),
+    "z": (-0.05, 0.05),
+    "roll": (-0.1, 0.1),
+    "pitch": (-0.1, 0.1),
+    "yaw": (-0.1, 0.1),
 }
 
 # 高度扫描是 torso_link 附近的局部网格，帮助 policy 看到箱子/地形高度。
@@ -52,10 +52,19 @@ HEIGHT_SCAN_OFFSET = 0.5
 class MySceneCfg(InteractiveSceneCfg):
     """带腿式机器人的 terrain 场景配置。"""
 
-    # 默认平地。train.py/play.py 可以额外插入本地 USD 箱子地形。
+    # 默认平地。使用本地生成的 mesh plane，避免 IsaacLab 默认 ground plane 依赖远端 Nucleus/S3 USD。
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
-        terrain_type="plane",
+        terrain_type="generator",
+        terrain_generator=TerrainGeneratorCfg(
+            size=(2000.0, 2000.0),
+            num_rows=1,
+            num_cols=1,
+            border_width=0.0,
+            use_cache=False,
+            sub_terrains={"plane": MeshPlaneTerrainCfg(proportion=1.0)},
+        ),
+        use_terrain_origins=False,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
@@ -63,10 +72,7 @@ class MySceneCfg(InteractiveSceneCfg):
             static_friction=1.0,
             dynamic_friction=1.0,
         ),
-        visual_material=sim_utils.MdlFileCfg(
-            mdl_path="{NVIDIA_NUCLEUS_DIR}/Materials/Base/Architecture/Shingles_01.mdl",
-            project_uvw=True,
-        ),
+        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.1, 0.1)),
     )
     # 机器人资产由具体机器人配置填入。
     robot: ArticulationCfg = MISSING
@@ -116,7 +122,7 @@ class CommandsCfg:
             "yaw": (-0.2, 0.2),
         },
         velocity_range=VELOCITY_RANGE,
-        joint_position_range=(-0.1, 0.1),
+        joint_position_range=(-0.01, 0.01),
     )
 
 
@@ -148,12 +154,6 @@ class ObservationsCfg:
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.5, n_max=0.5))
-        height_scan = ObsTerm(
-            func=mdp.height_scan,
-            params={"sensor_cfg": SceneEntityCfg("height_scanner"), "offset": HEIGHT_SCAN_OFFSET},
-            noise=Unoise(n_min=-0.05, n_max=0.05),
-            clip=(-1.0, 1.0),
-        )
         actions = ObsTerm(func=mdp.last_action)
 
         def __post_init__(self):
@@ -195,8 +195,8 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "static_friction_range": (0.3, 1.6),
-            "dynamic_friction_range": (0.3, 1.2),
+            "static_friction_range": (0.4, 1.3),
+            "dynamic_friction_range": (0.4, 1.1),
             "restitution_range": (0.0, 0.5),
             "num_buckets": 64,
         },
@@ -206,8 +206,18 @@ class EventCfg:
         func=mdp.randomize_joint_default_pos,
         mode="startup",
         params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[r"^(?!.*ankle.*).*$"]),
             "pos_distribution_params": (-0.01, 0.01),
+            "operation": "add",
+        },
+    )
+
+    add_ankle_joint_default_pos = EventTerm(
+        func=mdp.randomize_joint_default_pos,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*ankle.*"]),
+            "pos_distribution_params": (-0.03, 0.03),
             "operation": "add",
         },
     )
@@ -237,38 +247,18 @@ class RewardsCfg:
     # anchor reward 保持躯干/root 与参考轨迹对齐。
     motion_global_anchor_pos = RewTerm(
         func=mdp.motion_global_anchor_position_error_exp,
-        weight=0.5,
-        params={"command_name": "motion", "std": 0.3},
-    )
-    motion_global_anchor_height = RewTerm(
-        func=mdp.motion_global_anchor_height_error_exp,
         weight=1.0,
-        params={"command_name": "motion", "std": 0.12},
+        params={"command_name": "motion", "std": 0.3},
     )
     motion_global_anchor_ori = RewTerm(
         func=mdp.motion_global_anchor_orientation_error_exp,
-        weight=0.5,
+        weight=1.0,
         params={"command_name": "motion", "std": 0.4},
     )
     motion_body_pos = RewTerm(
         func=mdp.motion_relative_body_position_error_exp,
         weight=1.0,
         params={"command_name": "motion", "std": 0.3},
-    )
-    # 脚/手高度和竖直速度项对爬箱子、跳跃动作很重要。
-    motion_ee_height = RewTerm(
-        func=mdp.motion_relative_body_height_error_exp,
-        weight=1.0,
-        params={
-            "command_name": "motion",
-            "std": 0.12,
-            "body_names": [
-                "left_ankle_roll_link",
-                "right_ankle_roll_link",
-                "left_wrist_yaw_link",
-                "right_wrist_yaw_link",
-            ],
-        },
     )
     motion_body_ori = RewTerm(
         func=mdp.motion_relative_body_orientation_error_exp,
@@ -280,26 +270,12 @@ class RewardsCfg:
         weight=1.0,
         params={"command_name": "motion", "std": 1.0},
     )
-    motion_ee_vertical_vel = RewTerm(
-        func=mdp.motion_global_body_vertical_velocity_error_exp,
-        weight=0.5,
-        params={
-            "command_name": "motion",
-            "std": 0.5,
-            "body_names": [
-                "left_ankle_roll_link",
-                "right_ankle_roll_link",
-                "left_wrist_yaw_link",
-                "right_wrist_yaw_link",
-            ],
-        },
-    )
     motion_body_ang_vel = RewTerm(
         func=mdp.motion_global_body_angular_velocity_error_exp,
         weight=1.0,
         params={"command_name": "motion", "std": 3.14},
     )
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-3e-2)
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1e-1)
     # 避免 policy 贴近关节限位，并惩罚非末端执行器 link 的碰撞。
     joint_limit = RewTerm(
         func=mdp.joint_pos_limits,
@@ -308,7 +284,7 @@ class RewardsCfg:
     )
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
-        weight=-0.1,
+        weight=-0.5,
         params={
             "sensor_cfg": SceneEntityCfg(
                 "contact_forces",
@@ -326,27 +302,10 @@ class TerminationsCfg:
     """MDP 的终止条件。"""
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    # 高度/姿态/body 跟踪失败时尽早 reset 低质量 rollout。
+    # 按论文使用 anchor/pelvis 全局位置误差阈值。
     anchor_pos = DoneTerm(
-        func=mdp.bad_anchor_pos_z_only,
-        params={"command_name": "motion", "threshold": 0.45},
-    )
-    anchor_ori = DoneTerm(
-        func=mdp.bad_anchor_ori,
-        params={"asset_cfg": SceneEntityCfg("robot"), "command_name": "motion", "threshold": 0.8},
-    )
-    ee_body_pos = DoneTerm(
-        func=mdp.bad_motion_body_pos_z_only,
-        params={
-            "command_name": "motion",
-            "threshold": 0.8,
-            "body_names": [
-                "left_ankle_roll_link",
-                "right_ankle_roll_link",
-                "left_wrist_yaw_link",
-                "right_wrist_yaw_link",
-            ],
-        },
+        func=mdp.bad_anchor_pos,
+        params={"command_name": "motion", "threshold": 0.5},
     )
 
 

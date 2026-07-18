@@ -309,8 +309,10 @@ class MotionCommand(CommandTerm):
         self.body_quat_relative_w[:, :, 0] = 1.0
 
         self.bin_count = int(self.motion.max_duration_s) + 1
-        self.bin_failed_count = torch.zeros(self.bin_count, dtype=torch.float, device=self.device)
-        self._current_bin_failed = torch.zeros(self.bin_count, dtype=torch.float, device=self.device)
+        self.bin_failed_count = torch.zeros(
+            self.motion.num_motions, self.bin_count, dtype=torch.float, device=self.device
+        )
+        self._current_bin_failed = torch.zeros_like(self.bin_failed_count)
         self.kernel = torch.tensor(
             [self.cfg.adaptive_lambda**i for i in range(self.cfg.adaptive_kernel_size)], device=self.device
         )
@@ -326,6 +328,7 @@ class MotionCommand(CommandTerm):
         self.metrics["error_joint_vel"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["sampling_entropy"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["sampling_top1_prob"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["sampling_top1_motion"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["sampling_top1_bin"] = torch.zeros(self.num_envs, device=self.device)
 
     @property
@@ -452,58 +455,61 @@ class MotionCommand(CommandTerm):
     def _adaptive_sampling(self, env_ids: Sequence[int]):
         """为 reset 选择起始帧。
 
-        单轨迹时保留原来的 failure-adaptive bin 采样；
-        多轨迹时先均匀选择轨迹，再在对应轨迹长度内均匀选择起始帧。
+        统计每条 motion 的每个时间 bin 的失败次数，并优先从失败较多的
+        (motion_id, bin_id) 开始新 episode。
         """
-        if self.motion.num_motions > 1:
-            self.active_motion_ids[env_ids] = torch.randint(
-                self.motion.num_motions, (len(env_ids),), dtype=torch.long, device=self.device
-            )
-            motion_lengths = self.motion.time_step_totals[self.active_motion_ids[env_ids]].float()
-            self.time_step_f[env_ids] = sample_uniform(0.0, 1.0, (len(env_ids),), device=self.device) * (
-                motion_lengths - 1.0
-            )
-            self.time_steps[env_ids] = self.time_step_f[env_ids].long()
-            self.metrics["sampling_entropy"][:] = 1.0
-            self.metrics["sampling_top1_prob"][:] = 1.0 / self.motion.num_motions
-            self.metrics["sampling_top1_bin"][:] = 0.0
-            return
-
+        env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
         episode_failed = self._env.termination_manager.terminated[env_ids]
         if torch.any(episode_failed):
+            failed_env_ids = env_ids[episode_failed]
+            failed_motion_ids = self.active_motion_ids[failed_env_ids]
+            failed_motion_lengths = self.motion.time_step_totals[failed_motion_ids].float()
             current_bin_index = torch.clamp(
-                (self.time_step_f * self.bin_count / max(self.motion.max_time_step_total, 1)), 0, self.bin_count - 1
+                self.time_step_f[failed_env_ids] * self.bin_count / torch.clamp(failed_motion_lengths, min=1.0),
+                0,
+                self.bin_count - 1,
             )
-            fail_bins = current_bin_index.long()[env_ids][episode_failed]
-            self._current_bin_failed[:] = torch.bincount(fail_bins, minlength=self.bin_count)
+            failed_flat_bins = failed_motion_ids * self.bin_count + current_bin_index.long()
+            self._current_bin_failed[:] = torch.bincount(
+                failed_flat_bins, minlength=self.motion.num_motions * self.bin_count
+            ).view(self.motion.num_motions, self.bin_count)
 
         # 采样起始 bin
-        sampling_probabilities = self.bin_failed_count + self.cfg.adaptive_uniform_ratio / float(self.bin_count)
+        total_bins = self.motion.num_motions * self.bin_count
+        sampling_probabilities = self.bin_failed_count + self.cfg.adaptive_uniform_ratio / float(total_bins)
         sampling_probabilities = torch.nn.functional.pad(
-            sampling_probabilities.unsqueeze(0).unsqueeze(0),
+            sampling_probabilities.unsqueeze(1),
             (0, self.cfg.adaptive_kernel_size - 1),  # 非因果卷积核
             mode="replicate",
         )
-        sampling_probabilities = torch.nn.functional.conv1d(sampling_probabilities, self.kernel.view(1, 1, -1)).view(-1)
+        sampling_probabilities = torch.nn.functional.conv1d(
+            sampling_probabilities, self.kernel.view(1, 1, -1)
+        ).view(self.motion.num_motions, self.bin_count)
 
+        sampling_probabilities = sampling_probabilities.view(-1)
         sampling_probabilities = sampling_probabilities / sampling_probabilities.sum()
 
-        sampled_bins = torch.multinomial(sampling_probabilities, len(env_ids), replacement=True)
+        sampled_flat_bins = torch.multinomial(sampling_probabilities, len(env_ids), replacement=True)
+        sampled_motion_ids = torch.div(sampled_flat_bins, self.bin_count, rounding_mode="floor")
+        sampled_bins = sampled_flat_bins % self.bin_count
 
+        self.active_motion_ids[env_ids] = sampled_motion_ids
+        sampled_motion_lengths = self.motion.time_step_totals[sampled_motion_ids].float()
         self.time_step_f[env_ids] = (
             (sampled_bins + sample_uniform(0.0, 1.0, (len(env_ids),), device=self.device))
             / self.bin_count
-            * (self.motion.max_time_step_total - 1)
+            * (sampled_motion_lengths - 1.0)
         )
         self.time_steps[env_ids] = self.time_step_f[env_ids].long()
 
         # 记录采样分布指标
         H = -(sampling_probabilities * (sampling_probabilities + 1e-12).log()).sum()
-        H_norm = H / math.log(self.bin_count)
+        H_norm = H / math.log(total_bins) if total_bins > 1 else torch.ones_like(H)
         pmax, imax = sampling_probabilities.max(dim=0)
         self.metrics["sampling_entropy"][:] = H_norm
         self.metrics["sampling_top1_prob"][:] = pmax
-        self.metrics["sampling_top1_bin"][:] = imax.float() / self.bin_count
+        self.metrics["sampling_top1_motion"][:] = torch.div(imax, self.bin_count, rounding_mode="floor").float()
+        self.metrics["sampling_top1_bin"][:] = (imax % self.bin_count).float() / self.bin_count
 
     def _resample_command(self, env_ids: Sequence[int]):
         """把选中的环境 reset 到参考姿态，并叠加配置中的随机扰动。"""

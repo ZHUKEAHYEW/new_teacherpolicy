@@ -18,7 +18,7 @@ class G1FlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
     # 24 steps * 0.02s 控制周期 = 每次 PPO 更新前，每个环境收集 0.48s rollout。
     num_steps_per_env = 24
-    max_iterations = 30000
+    max_iterations = 20000
     save_interval = 500
     experiment_name = "g1_flat"
     empirical_normalization = True

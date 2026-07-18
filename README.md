@@ -37,7 +37,7 @@ python scripts/rsl_rl/train.py --multi climb_15_z_scale_1.0
 ```
 or
 ```bash
-python scripts/rsl_rl/train.py --simple climb_15_z_scale_1.0
+python scripts/rsl_rl/train.py --simple climb_08_z_scale_1.0
 ```
 默认参数：
 

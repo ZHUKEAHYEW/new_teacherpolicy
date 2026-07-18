@@ -1,6 +1,6 @@
 from isaaclab.utils import configclass
 
-from whole_body_tracking.robots.g1 import G1_ACTION_SCALE, G1_CYLINDER_CFG
+from whole_body_tracking.robots.g1 import G1_CYLINDER_CFG
 from whole_body_tracking.tasks.tracking.config.g1.agents.rsl_rl_ppo_cfg import LOW_FREQ_SCALE
 from whole_body_tracking.tasks.tracking.tracking_env_cfg import TrackingEnvCfg
 
@@ -18,8 +18,8 @@ class G1FlatEnvCfg(TrackingEnvCfg):
 
         # 用基于 G1 URDF 的 articulation 替换通用机器人占位符。
         self.scene.robot = G1_CYLINDER_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-        # 每个关节的 action scale 来自 robots/g1.py 中的 actuator effort/stiffness。
-        self.actions.joint_pos.scale = G1_ACTION_SCALE
+        # PHP/BeyondMimic expert 设定：所有关节使用统一 action scale。
+        self.actions.joint_pos.scale = 1.0
         # torso_link 是用于 root 对齐的 tracking anchor。
         self.commands.motion.anchor_body_name = "torso_link"
         # tracked body 列表比完整 URDF 更小，用于稳定 reward 和 observation。
